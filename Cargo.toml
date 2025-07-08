@@ -17,3 +17,15 @@ reth-evm = { git = "https://github.com/paradigmxyz/reth.git" }
 
 eyre = "0.6" # Easy error handling
 futures-util = "0.3" # Stream utilities for consuming notifications
+thiserror = "2.0"
+async-trait = "0.1"
+tokio = { version = "1.0", features = ["sync", "rt", "macros"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+aws-config = "1.1"
+aws-sdk-dynamodb = "1.11"
+aws-smithy-runtime-api = "1.1"
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3.0"

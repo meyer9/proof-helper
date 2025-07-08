@@ -1,0 +1,30 @@
+# Proof Helper Configuration File - DynamoDB Backend
+# This configuration enables DynamoDB for production use
+
+[storage]
+# Use DynamoDB as the storage backend
+backend = "dynamodb"
+
+# DynamoDB configuration
+[storage.dynamodb]
+table_name = "proof-helper-preimages"
+region = "us-east-1"
+
+# For production, omit endpoint_url to use AWS DynamoDB
+# endpoint_url = "http://localhost:8000"  # Only for DynamoDB Local
+
+# Set to use on-demand billing (recommended for production)
+# read_capacity = 10    # Uncomment for provisioned mode
+# write_capacity = 10   # Uncomment for provisioned mode
+
+[logging]
+# Use debug level for initial deployment, then switch to info
+level = "info"
+# Log progress every 1000 preimages for production
+progress_interval = 1000
+
+[processing]
+# Maximum number of blocks to process behind head
+max_block_diff = 1000
+# Batch size for storage operations (optimized for DynamoDB)
+batch_size = 25 
