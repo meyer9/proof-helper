@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 reth = { git = "https://github.com/paradigmxyz/reth.git" } # Reth
+op-reth = { git = "https://github.com/paradigmxyz/reth.git" } # Reth
 reth-exex = { git = "https://github.com/paradigmxyz/reth.git" } # Execution Extensions
 reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth.git" } # Ethereum Node implementation
 reth-tracing = { git = "https://github.com/paradigmxyz/reth.git" } # Logging
@@ -12,6 +13,7 @@ reth-trie = { git = "https://github.com/paradigmxyz/reth.git" }
 reth-trie-db = { git = "https://github.com/paradigmxyz/reth.git" }
 reth-db-api = { git = "https://github.com/paradigmxyz/reth.git" }
 reth-execution-types = { git = "https://github.com/paradigmxyz/reth.git" }
+reth-evm = { git = "https://github.com/paradigmxyz/reth.git" }
 
 eyre = "0.6" # Easy error handling
 futures-util = "0.3" # Stream utilities for consuming notifications
