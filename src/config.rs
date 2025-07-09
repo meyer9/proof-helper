@@ -227,7 +227,7 @@ impl Default for ProofHelperConfig {
                 progress_interval: 100,
             },
             processing: ProcessingConfig {
-                max_block_diff: 1000,
+                max_block_diff: 2000,
                 batch_size: 1000,
             },
         }

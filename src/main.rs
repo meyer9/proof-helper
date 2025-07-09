@@ -49,7 +49,7 @@ where
         progress_interval: u64,
     ) -> eyre::Result<()> {
         let block_number = block.header().number();
-        let state_provider = self.ctx.provider().state_by_block_id(block_number.saturating_sub(1).into())?;
+        let state_provider = self.ctx.provider().state_by_block_id(block.header().parent_hash().into())?;
     
         let db = StateProviderDatabase::new(&state_provider);
         let block_executor = self.ctx.evm_config().batch_executor(db);
@@ -141,9 +141,9 @@ where
                             continue;
                         }
 
-                        if let Err(err) = self.process_block(block, progress_interval) {
-                            warn!("Error processing block {}: {}", block_number, err);
-                        }
+                        // if let Err(err) = self.process_block(block, progress_interval) {
+                        //     warn!("Error processing block {}: {}", block_number, err);
+                        // }
                     }
                 }
                 _ => {}
@@ -186,18 +186,19 @@ async fn create_storage(config: &ProofHelperConfig) -> eyre::Result<Arc<dyn Prei
     }
 }
 
+
 fn main() -> eyre::Result<()> {
     // Parse command line arguments to check for config file
     let args: Vec<String> = std::env::args().collect();
     let mut config_file_path: Option<String> = None;
     
-    // Simple argument parsing for --config flag
-    for i in 0..args.len() {
-        if args[i] == "--config" && i + 1 < args.len() {
-            config_file_path = Some(args[i + 1].clone());
-            break;
-        }
-    }
+    // // Simple argument parsing for --config flag
+    // for i in 0..args.len() {
+    //     if args[i] == "--config" && i + 1 < args.len() {
+    //         config_file_path = Some(args[i + 1].clone());
+    //         break;
+    //     }
+    // }
     
     // Load configuration
     let config = if let Some(path) = config_file_path {
@@ -223,6 +224,8 @@ fn main() -> eyre::Result<()> {
                 // Create storage backend based on configuration
                 let storage = create_storage(&config).await
                     .map_err(|e| eyre::eyre!("Failed to create storage backend: {}", e))?;
+
+                
                 
                 let proof_helper = ProofHelper::new(ctx, storage);
                 Ok(proof_helper.run(config))
