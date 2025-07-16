@@ -125,6 +125,10 @@ impl PreimageBatch {
         self.items.insert(hash, preimage);
     }
 
+    pub fn get_preimage(&self, hash: B256) -> Option<Vec<u8>> {
+        self.items.get(&hash).cloned()
+    }
+
     /// Check if the batch is empty
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()

@@ -14,6 +14,10 @@ reth-trie-db = { git = "https://github.com/paradigmxyz/reth.git" }
 reth-db-api = { git = "https://github.com/paradigmxyz/reth.git" }
 reth-execution-types = { git = "https://github.com/paradigmxyz/reth.git" }
 reth-evm = { git = "https://github.com/paradigmxyz/reth.git" }
+reth-stateless = { git = "https://github.com/paradigmxyz/reth.git" }
+reth-trie-sparse = { git = "https://github.com/paradigmxyz/reth.git" }
+reth-trie-common = { git = "https://github.com/paradigmxyz/reth.git" }
+alloy-rlp = "0.3.12"
 
 eyre = "0.6" # Easy error handling
 futures-util = "0.3" # Stream utilities for consuming notifications

@@ -1,0 +1,55 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug executable 'proof-helper'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=proof-helper",
+                    "--package=proof-helper"
+                ],
+                "filter": {
+                    "name": "proof-helper",
+                    "kind": "bin"
+                }
+            },
+            "args": [
+                "node",
+                "--debug.max-block",
+                "1000",
+                "--debug.tip",
+                "0x91c90676cab257a59cd956d7cb0bceb9b1a71d79755c23c7277a0697ccfaf8c4",
+                "--trusted-peers",
+                "enode://18b62a9e875d666f8b87403dd2bd1e74b781a957204640a0f68d9201d5c959af267028be6cced81a141ba3c38ba661260ad46eb5462bdf3881e6854493e385b1@127.0.0.1:30303",
+                "--instance",
+                "2"
+            ],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug unit tests in executable 'proof-helper'",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--bin=proof-helper",
+                    "--package=proof-helper"
+                ],
+                "filter": {
+                    "name": "proof-helper",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}
