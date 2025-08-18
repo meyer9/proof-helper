@@ -65,116 +65,7 @@ where
         let parent_hash = block.header().parent_hash();
         let parent_number = block.header().number().saturating_sub(1);
 
-        debug!(
-            "processing block number={}, parent_number={}, parent_hash={:?}",
-            block.header().number(),
-            parent_number,
-            parent_hash
-        );
-
-        // Use proper historical state access - get state at parent hash
-        // This ensures we get the exact state before the current block was executed
-        // (same pattern as debug RPC uses)
         let state_provider = self.ctx.provider().history_by_block_hash(parent_hash)?;
-
-        debug!("executing block {}, num txs: {}", block_number, block.body().transactions().collect::<Vec<_>>().len());
-
-        // this is correct
-        // debug initial state root intentionally removed to avoid trait ambiguity
-        // debug!("initial state root: {:?}", state_provider.state_root(Default::default()));
-
-        // Target address instrumentation to diagnose nonce increment
-        let target_addr: Address = "0xDeaDDEaDDeAdDeAdDEAdDEaddeAddEAdDEAd0001".parse().unwrap();
-        let target_hashed = keccak256(target_addr);
-
-        // Get the correct parent nonce using historical state provider
-        let parent_nonce = state_provider
-            .basic_account(&target_addr)?
-            .map(|a| a.nonce)
-            .unwrap_or(0);
-        debug!("parent nonce using history_by_block_hash: {}", parent_nonce);
-
-        // Also check nonce at earlier blocks to detect systematic offset
-        if parent_number > 0 {
-            let earlier_provider = self
-                .ctx
-                .provider()
-                .state_by_block_number_or_tag(BlockNumberOrTag::Number(parent_number.saturating_sub(1)))?;
-            let earlier_nonce = earlier_provider
-                .basic_account(&target_addr)?
-                .map(|a| a.nonce)
-                .unwrap_or(0);
-            debug!(
-                "nonce at block {}: {}",
-                parent_number.saturating_sub(1),
-                earlier_nonce
-            );
-        }
-
-        // Test reading from explicit block numbers to verify which block we're actually getting
-        for test_block_num in [parent_number.saturating_sub(2), parent_number.saturating_sub(1), parent_number, parent_number + 1] {
-            if let Ok(test_provider) = self
-                .ctx
-                .provider()
-                .state_by_block_number_or_tag(BlockNumberOrTag::Number(test_block_num))
-            {
-                let test_nonce = test_provider
-                    .basic_account(&target_addr)?
-                    .map(|a| a.nonce)
-                    .unwrap_or(0);
-                debug!("nonce at explicit block {}: {}", test_block_num, test_nonce);
-            }
-        }
-
-        // Try using history_by_block_number which should give pre-execution state
-        if let Ok(historical_provider) = self.ctx.provider().history_by_block_number(parent_number) {
-            let historical_nonce = historical_provider
-                .basic_account(&target_addr)?
-                .map(|a| a.nonce)
-                .unwrap_or(0);
-            debug!("nonce via history_by_block_number({}): {}", parent_number, historical_nonce);
-        }
-
-        // Also try getting the parent block header and using its parent for state
-        let grandparent_number = parent_number.saturating_sub(1);
-        if let Ok(grandparent_provider) = self.ctx.provider().history_by_block_number(grandparent_number) {
-            let grandparent_nonce = grandparent_provider
-                .basic_account(&target_addr)?
-                .map(|a| a.nonce)
-                .unwrap_or(0);
-            debug!("nonce at grandparent block {}: {}", grandparent_number, grandparent_nonce);
-            debug!("expected parent nonce should be: {} + 1 = {}", grandparent_nonce, grandparent_nonce + 1);
-        }
-
-        // Parent nonce already logged above using history_by_block_hash
-
-        // Try to find where the correct parent nonce (28899403) actually is
-        debug!("searching for correct parent nonce 28899403:");
-        for search_block in (parent_number.saturating_sub(5))..=(parent_number + 2) {
-            if let Ok(search_provider) = self.ctx.provider().history_by_block_number(search_block) {
-                let search_nonce = search_provider
-                    .basic_account(&target_addr)?
-                    .map(|a| a.nonce)
-                    .unwrap_or(0);
-                if search_nonce == 28899403 {
-                    debug!("FOUND correct parent nonce 28899403 at block {}", search_block);
-                }
-            }
-        }
-
-        // Try to determine what block the state_provider thinks it's at
-        // by checking if it can give us the parent hash
-        let provider_block_hash = self.ctx.provider().sealed_header(parent_number)?.expect("parent block not found").hash();
-        debug!("block hash at parent_number {}: {:?}", parent_number, provider_block_hash);
-        debug!("expected parent_hash: {:?}", parent_hash);
-        debug!("hashes match: {}", provider_block_hash == parent_hash);
-    
-
-        // Log the first few transaction nonces in this block for reference
-        debug!("first few tx nonces in block:");
-        for (i, tx) in block.body().transactions().enumerate().take(3) {
-            debug!("  tx[{}]: nonce={}, from={:?}", i, tx.nonce(), block.senders().get(i));
-        }
 
         let db = StateProviderDatabase::new(&state_provider);
         let block_executor = self.ctx.evm_config().batch_executor(db);
@@ -187,72 +78,25 @@ where
             })
             .map_err(|err| eyre::eyre!(err))?;
 
-        // Derive hashed post-state from the executor's bundle state (authoritative post-state)
         let hashed_state = HashedPostState::from_bundle_state::<KeccakKeyHasher>(
             execution_result.state.state(),
         );
-
-        // Log post nonce for the target account and delta
-        let post_nonce = hashed_state
-            .accounts
-            .get(&target_hashed)
-            .and_then(|a| a.as_ref().map(|i| i.nonce))
-            .unwrap_or(parent_nonce);
-        debug!(
-            "post nonce for {:?}: {}, delta: {}",
-            target_addr,
-            post_nonce,
-            post_nonce.saturating_sub(parent_nonce)
-        );
-
-        // Count how many transactions in the block are from the target address
-        let tx_senders = block.senders();
-        let mut from_count = 0usize;
-        for sender in tx_senders.iter() {
-            if *sender == target_addr { from_count += 1; }
-        }
-        debug!(
-            "block senders from target {:?}: {}",
-            target_addr,
-            from_count
-        );
-
-        let initial_state_provider = self.ctx.provider().history_by_block_hash(parent_hash)?;
-
-        let (state_root, _) = initial_state_provider.state_root_with_updates(hashed_state.clone())?;
-        debug!("state root: {:?}", state_root);
 
         let mut targets = B256Map::<B256Set>::with_capacity_and_hasher(hashed_state.storages.len(), Default::default());
 
         for (address, storage) in hashed_state.storages.iter() {
             let mut set = targets.entry(address.clone()).or_default();
             for (slot, _) in storage.storage.iter() {
-                debug!("slot {:?} of address {:?} changed", slot, address);
                 set.insert(slot.clone());
             }
         }
 
         // for addresses, ensure that the key exists, otherwise insert an empty set
         for (address, new_account) in hashed_state.accounts.iter() {
-            // nonce here is too high, indicating double execution
-            debug!("address {:?} changed to {:?}", address, new_account);
             targets.entry(address.clone()).or_default();
         }
 
-        let multiproof = initial_state_provider.multiproof(TrieInput::from_state(hashed_state), targets.into_iter().collect())?;
-
-        // let prefix_sets = post_state.construct_prefix_sets().freeze();
-        // let state_sorted = post_state.into_sorted();
-        
-
-        // let trie_cursor_factory = DatabaseTrieCursorFactory::new(tx);
-        // let hashed_cursor_factory = HashedPostStateCursorFactory::new(DatabaseHashedCursorFactory::new(tx), &post_state);
-            // StateRoot::new(
-            //     DatabaseTrieCursorFactory::new(tx),
-            //     HashedPostStateCursorFactory::new(DatabaseHashedCursorFactory::new(tx), &state_sorted),
-            // )
-            // .with_prefix_sets(prefix_sets)
-            // .root_with_updates()
+        let multiproof = state_provider.multiproof(TrieInput::from_state(hashed_state), targets.into_iter().collect())?;
 
         let mut preimages = Vec::new();
 
