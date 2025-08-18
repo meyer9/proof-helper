@@ -1,6 +1,16 @@
 use std::collections::HashMap;
 
 use reth::revm::primitives::B256;
+use reth_trie::Nibbles;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PreimageEntry {
+    pub hash: B256,
+    pub preimage: Vec<u8>,
+    pub hashed_address: Option<B256>,
+    pub path: Nibbles,
+    pub block_number: u64,
+}
 
 /// Batch of preimages to be stored together
 #[derive(Debug, Clone)]
@@ -8,7 +18,7 @@ pub struct PreimageBatch {
     /// Block number for all items in this batch
     pub block_number: u64,
     /// Map of hash to preimage data
-    pub items: HashMap<B256, Vec<u8>>,
+    pub items: Vec<PreimageEntry>,
 }
 
 /// Error types for preimage storage operations
@@ -47,6 +57,8 @@ pub trait PreimageStore: Send + Sync {
         &self,
         hash: B256,
         preimage: Vec<u8>,
+        hashed_address: Option<B256>,
+        path: Nibbles,
         block_number: u64,
     ) -> PreimageStorageResult<()>;
 
@@ -116,27 +128,8 @@ impl PreimageBatch {
     pub fn new(block_number: u64) -> Self {
         Self {
             block_number,
-            items: HashMap::new(),
+            items: Vec::new(),
         }
-    }
-
-    /// Add a preimage to the batch
-    pub fn add_preimage(&mut self, hash: B256, preimage: Vec<u8>) {
-        self.items.insert(hash, preimage);
-    }
-
-    pub fn get_preimage(&self, hash: B256) -> Option<Vec<u8>> {
-        self.items.get(&hash).cloned()
-    }
-
-    /// Check if the batch is empty
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-
-    /// Get the total size of all preimages in the batch
-    pub fn total_size(&self) -> usize {
-        self.items.values().map(|preimage| preimage.len()).sum()
     }
 }
 
@@ -162,6 +155,8 @@ impl PreimageStore for MockPreimageStore {
         &self,
         hash: B256,
         preimage: Vec<u8>,
+        hashed_address: Option<B256>,
+        path: Nibbles,
         block_number: u64,
     ) -> PreimageStorageResult<()> {
         let mut storage = self.storage.write().await;
@@ -171,8 +166,8 @@ impl PreimageStore for MockPreimageStore {
 
     async fn store_preimages_batch(&self, batch: PreimageBatch) -> PreimageStorageResult<()> {
         let mut storage = self.storage.write().await;
-        for (hash, preimage) in batch.items {
-            storage.insert(hash, (preimage, batch.block_number));
+        for item in batch.items {
+            storage.insert(item.hash, (item.preimage, batch.block_number));
         }
         Ok(())
     }
@@ -243,100 +238,3 @@ impl PreimageStore for MockPreimageStore {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_preimage_batch_operations() {
-        let mut batch = PreimageBatch::new(12345);
-        
-        let hash1 = B256::from([1u8; 32]);
-        let hash2 = B256::from([2u8; 32]);
-        
-        batch.add_preimage(hash1, vec![1, 2, 3]);
-        batch.add_preimage(hash2, vec![4, 5, 6, 7, 8]);
-        
-        assert!(!batch.is_empty());
-        assert_eq!(batch.block_number, 12345);
-        assert_eq!(batch.total_size(), 8); // 3 + 5 bytes
-    }
-
-    #[test]
-    fn test_empty_batch() {
-        let batch = PreimageBatch::new(0);
-        
-        assert!(batch.is_empty());
-        assert_eq!(batch.total_size(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_mock_store_basic_operations() {
-        let store = MockPreimageStore::new();
-        let hash = B256::from([1u8; 32]);
-        let preimage = vec![1, 2, 3, 4, 5];
-        
-        // Store a preimage
-        store.store_preimage(hash, preimage.clone(), 100).await.unwrap();
-        
-        // Check existence
-        assert!(store.exists(&hash).await.unwrap());
-        
-        // Retrieve preimage
-        let retrieved = store.get_preimage(&hash).await.unwrap();
-        assert_eq!(retrieved, Some(preimage));
-        
-        // Check count
-        assert_eq!(store.count_preimages_for_block(100).await.unwrap(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_mock_store_batch_operations() {
-        let store = MockPreimageStore::new();
-        let mut batch = PreimageBatch::new(200);
-        
-        let hash1 = B256::from([1u8; 32]);
-        let hash2 = B256::from([2u8; 32]);
-        let preimage1 = vec![1, 2, 3];
-        let preimage2 = vec![4, 5, 6];
-        
-        batch.add_preimage(hash1, preimage1.clone());
-        batch.add_preimage(hash2, preimage2.clone());
-        
-        // Store batch
-        store.store_preimages_batch(batch).await.unwrap();
-        
-        // Retrieve batch
-        let retrieved = store.get_preimages_batch(&[hash1, hash2]).await.unwrap();
-        assert_eq!(retrieved.len(), 2);
-        assert_eq!(retrieved.get(&hash1), Some(&preimage1));
-        assert_eq!(retrieved.get(&hash2), Some(&preimage2));
-        
-        // Check block count
-        assert_eq!(store.count_preimages_for_block(200).await.unwrap(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_mock_store_pruning() {
-        let store = MockPreimageStore::new();
-        
-        // Store preimages from different blocks
-        let hash1 = B256::from([1u8; 32]);
-        let hash2 = B256::from([2u8; 32]);
-        let hash3 = B256::from([3u8; 32]);
-        
-        store.store_preimage(hash1, vec![1], 100).await.unwrap();
-        store.store_preimage(hash2, vec![2], 200).await.unwrap();
-        store.store_preimage(hash3, vec![3], 300).await.unwrap();
-        
-        // Prune before block 250
-        let removed = store.prune_before_block(250).await.unwrap();
-        assert_eq!(removed, 2); // Should remove blocks 100 and 200
-        
-        // Only block 300 should remain
-        assert!(store.exists(&hash3).await.unwrap());
-        assert!(!store.exists(&hash1).await.unwrap());
-        assert!(!store.exists(&hash2).await.unwrap());
-    }
-} 

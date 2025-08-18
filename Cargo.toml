@@ -15,8 +15,6 @@ reth-db-api = { git = "https://github.com/paradigmxyz/reth.git" }
 reth-execution-types = { git = "https://github.com/paradigmxyz/reth.git" }
 reth-evm = { git = "https://github.com/paradigmxyz/reth.git" }
 reth-stateless = { git = "https://github.com/paradigmxyz/reth.git" }
-reth-trie-sparse = { git = "https://github.com/paradigmxyz/reth.git" }
-reth-trie-common = { git = "https://github.com/paradigmxyz/reth.git" }
 alloy-rlp = "0.3.12"
 
 eyre = "0.6" # Easy error handling
@@ -33,3 +31,20 @@ hex = "0.4"
 
 [dev-dependencies]
 tempfile = "3.0"
+
+# [patch."https://github.com/paradigmxyz/reth.git"]
+# reth-trie = { path = "../reth/crates/trie/trie" }
+# reth-trie-db = { path = "../reth/crates/trie/db" }
+# reth = { path = "../reth/bin/reth" }
+# op-reth = { path = "../reth/crates/optimism/bin" }
+# reth-exex = { path = "../reth/crates/exex/exex" }
+# reth-node-ethereum = { path = "../reth/crates/ethereum/node" }
+# reth-tracing = { path = "../reth/crates/tracing" }
+# reth-db-api = { path = "../reth/crates/storage/db-api" }
+# reth-execution-types = { path = "../reth/crates/evm/execution-types" }
+# reth-evm = { path = "../reth/crates/evm/evm" }
+# reth-stateless = { path = "../reth/crates/stateless" }
+
+
+# [patch.crates-io]
+# alloy-trie = { path = "../trie" }
