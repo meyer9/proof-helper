@@ -5,7 +5,6 @@ use aws_sdk_dynamodb::{
     types::{
         AttributeValue, WriteRequest, PutRequest, DeleteRequest, Select
     },
-    error::SdkError,
 };
 use reth::revm::primitives::B256;
 use reth_trie::Nibbles;

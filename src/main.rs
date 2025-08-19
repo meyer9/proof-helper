@@ -1,30 +1,26 @@
-use alloy_rlp::{Decodable, Encodable};
 use futures_util::TryStreamExt;
 use op_reth::node::OpNode;
 use op_reth::primitives::OpPrimitives;
 use reth::{
-    api::{Block, ConfigureEvm, FullNodeComponents, NodePrimitives},
+    api::{ConfigureEvm, FullNodeComponents, NodePrimitives},
     builder::NodeTypes,
     core::primitives::AlloyBlockHeader,
     primitives::RecoveredBlock,
-    providers::{BlockReader, HeaderProvider, StateProviderFactory, StateReader},
+    providers::{BlockReader, StateProviderFactory, StateReader, TransactionVariant},
     revm::{
-        database::StateProviderDatabase, primitives::{keccak256, map::{B256Map, B256Set}, Address, B256, KECCAK_EMPTY}, state::AccountInfo, witness::ExecutionWitnessRecord, State
-    }, rpc::types::BlockNumberOrTag,
+        database::StateProviderDatabase,
+        primitives::{
+            keccak256,
+            map::{B256Map, B256Set},
+        },
+    },
 };
-use reth_db_api::table::Encode;
 use reth_evm::execute::Executor;
 use reth_exex::{ExExContext, ExExEvent, ExExNotification};
-use reth_stateless::ExecutionWitness;
-use reth_tracing::tracing::{info, trace, warn, debug};
-use reth_trie::{
-    BranchNodeCompact, HashedStorage, LeafNode, MultiProofTargets, Nibbles, StoredNibbles, StoredNibblesSubKey, TrieAccount, TrieInput, TrieNode
-};
-use std::collections::HashMap;
-use std::collections::VecDeque;
-use std::sync::Arc;
+use reth_tracing::tracing::{info, warn};
+use reth_trie::TrieInput;
 use reth_trie::{HashedPostState, KeccakKeyHasher};
-use reth::rpc::types::TransactionTrait;
+use std::sync::Arc;
 
 mod config;
 mod dynamodb;
@@ -32,7 +28,7 @@ mod storage;
 
 use config::{ProofHelperConfig, StorageBackend};
 use dynamodb::DynamoDbPreimageStore;
-use storage::{MockPreimageStore, PreimageEntry, PreimageStore, PreimageBatch};
+use storage::{PreimageBatch, PreimageEntry, PreimageStore};
 
 /// Proof Helper ExEx - processes blocks and tracks state changes
 pub struct ProofHelper<Node>
@@ -46,9 +42,7 @@ where
 
 impl<Node> ProofHelper<Node>
 where
-    Node: FullNodeComponents<
-        Types: NodeTypes<Primitives = OpPrimitives>,
-    >,
+    Node: FullNodeComponents<Types: NodeTypes<Primitives = OpPrimitives>>,
     Node::Provider: StateReader + StateProviderFactory + BlockReader,
 {
     /// Create a new ProofHelper instance
@@ -59,44 +53,43 @@ where
     fn process_block(
         &self,
         block: &RecoveredBlock<<<Node::Types as NodeTypes>::Primitives as NodePrimitives>::Block>,
-        progress_interval: u64,
     ) -> eyre::Result<()> {
         let block_number = block.header().number();
         let parent_hash = block.header().parent_hash();
-        let parent_number = block.header().number().saturating_sub(1);
-
         let state_provider = self.ctx.provider().history_by_block_hash(parent_hash)?;
 
         let db = StateProviderDatabase::new(&state_provider);
         let block_executor = self.ctx.evm_config().batch_executor(db);
-    
-        let mut witness_record = ExecutionWitnessRecord::default();
 
         let execution_result = block_executor
-            .execute_with_state_closure(&(*block).clone(), |state: &State<_>| {
-                witness_record.record_executed_state(state);
-            })
+            .execute(&(*block).clone())
             .map_err(|err| eyre::eyre!(err))?;
 
-        let hashed_state = HashedPostState::from_bundle_state::<KeccakKeyHasher>(
-            execution_result.state.state(),
+        let hashed_state =
+            HashedPostState::from_bundle_state::<KeccakKeyHasher>(execution_result.state.state());
+
+        let mut targets = B256Map::<B256Set>::with_capacity_and_hasher(
+            hashed_state.storages.len(),
+            Default::default(),
         );
 
-        let mut targets = B256Map::<B256Set>::with_capacity_and_hasher(hashed_state.storages.len(), Default::default());
-
         for (address, storage) in hashed_state.storages.iter() {
-            let mut set = targets.entry(address.clone()).or_default();
+            let set = targets.entry(address.clone()).or_default();
             for (slot, _) in storage.storage.iter() {
                 set.insert(slot.clone());
             }
         }
 
         // for addresses, ensure that the key exists, otherwise insert an empty set
-        for (address, new_account) in hashed_state.accounts.iter() {
+        for (address, _) in hashed_state.accounts.iter() {
             targets.entry(address.clone()).or_default();
         }
 
-        let multiproof = state_provider.multiproof(TrieInput::from_state(hashed_state), targets.into_iter().collect())?;
+        // prove all the changed keys
+        let multiproof = state_provider.multiproof(
+            TrieInput::from_state(hashed_state),
+            targets.into_iter().collect(),
+        )?;
 
         let mut preimages = Vec::new();
 
@@ -129,13 +122,23 @@ where
         // Store the batch
         let storage_clone = Arc::clone(&self.storage);
         tokio::spawn(async move {
-            if let Err(e) = storage_clone.store_preimages_batch(PreimageBatch {
-                block_number: block_number,
-                items: preimages.clone(),
-            }).await {
-                warn!("Failed to store preimages for block {}: {}", block_number, e);
+            if let Err(e) = storage_clone
+                .store_preimages_batch(PreimageBatch {
+                    block_number: block_number,
+                    items: preimages.clone(),
+                })
+                .await
+            {
+                warn!(
+                    "Failed to store preimages for block {}: {}",
+                    block_number, e
+                );
             } else {
-                info!("Successfully stored {} preimages for block {}", preimages.len(), block_number);
+                info!(
+                    "Successfully stored {} preimages for block {}",
+                    preimages.len(),
+                    block_number
+                );
             }
         });
 
@@ -145,7 +148,6 @@ where
     /// Main execution loop for the ExEx
     pub async fn run(mut self, config: ProofHelperConfig) -> eyre::Result<()> {
         let max_block_diff = config.processing.max_block_diff;
-        let progress_interval = config.logging.progress_interval;
 
         while let Some(notification) = self.ctx.notifications.try_next().await? {
             match &notification {
@@ -161,9 +163,16 @@ where
                             continue;
                         }
 
-                        let parent_block = self.ctx.provider().block(block.header().parent_hash().into())?.expect("parent block not found");
+                        let Some(parent_block) = self.ctx.provider().recovered_block(
+                            block.header().parent_hash().into(),
+                            TransactionVariant::NoHash,
+                        )?
+                        else {
+                            warn!("Parent block not found for block {}", block_number);
+                            continue;
+                        };
 
-                        if let Err(err) = self.process_block(&parent_block.try_into_recovered()?, progress_interval) {
+                        if let Err(err) = self.process_block(&parent_block) {
                             warn!("Error processing block {}: {}", block_number, err);
                         }
                     }
@@ -186,10 +195,6 @@ where
 /// Create storage backend based on configuration
 async fn create_storage(config: &ProofHelperConfig) -> eyre::Result<Arc<dyn PreimageStore>> {
     match config.storage.backend {
-        StorageBackend::Mock => {
-            info!("Using mock storage backend");
-            Ok(Arc::new(MockPreimageStore::new()))
-        }
         StorageBackend::DynamoDB => {
             info!("Using DynamoDB storage backend");
             let dynamodb_config = config.storage.dynamodb.as_ref().ok_or_else(|| {
@@ -213,34 +218,9 @@ async fn create_storage(config: &ProofHelperConfig) -> eyre::Result<Arc<dyn Prei
 }
 
 fn main() -> eyre::Result<()> {
-    // Parse command line arguments to check for config file
-    let args: Vec<String> = std::env::args().collect();
-    let mut config_file_path: Option<String> = None;
-
-    // // Simple argument parsing for --config flag
-    // for i in 0..args.len() {
-    //     if args[i] == "--config" && i + 1 < args.len() {
-    //         config_file_path = Some(args[i + 1].clone());
-    //         break;
-    //     }
-    // }
-
     // Load configuration
-    let config = if let Some(path) = config_file_path {
-        info!("Loading configuration from file: {}", path);
-        ProofHelperConfig::load_from_file(&path)
-            .map_err(|e| eyre::eyre!("Failed to load configuration: {}", e))?
-    } else {
-        info!("Loading configuration from environment variables");
-        ProofHelperConfig::load_from_env()
-            .map_err(|e| eyre::eyre!("Failed to load configuration: {}", e))?
-    };
-
-    info!("Configuration loaded successfully");
-    info!("Storage backend: {:?}", config.storage.backend);
-    info!("Log level: {}", config.logging.level);
-    info!("Progress interval: {}", config.logging.progress_interval);
-    info!("Max block diff: {}", config.processing.max_block_diff);
+    let config = ProofHelperConfig::load_from_env()
+        .map_err(|e| eyre::eyre!("Failed to load configuration: {}", e))?;
 
     op_reth::cli::Cli::parse_args().run(async move |builder, _| {
         let handle = builder
