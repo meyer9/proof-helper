@@ -19,24 +19,27 @@ pub struct ProofHelperConfig {
 pub struct StorageConfig {
     /// Backend type
     pub backend: StorageBackend,
-    
-    /// DynamoDB specific configuration (optional)
-    pub dynamodb: Option<DynamoDbConfig>,
+
+    /// SQLite specific configuration (optional)
+    pub sqlite: Option<SqliteConfig>,
 }
 
 /// Storage backend types
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageBackend {
-    /// DynamoDB storage for production
-    DynamoDB,
+    /// Embedded SQLite storage
+    SQLite,
 }
 
 /// DynamoDB specific configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DynamoDbConfig {
     /// DynamoDB table name
-    pub table_name: String,
+    pub branch_table_name: String,
+
+    /// DynamoDB table name
+    pub earliest_block_number_table_name: String,
     
     /// AWS region
     pub region: String,
@@ -49,6 +52,13 @@ pub struct DynamoDbConfig {
     
     /// Write capacity units for table creation
     pub write_capacity: Option<u32>,
+}
+
+/// SQLite specific configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SqliteConfig {
+    /// Path to SQLite database file
+    pub db_path: String,
 }
 
 /// Logging configuration
@@ -97,33 +107,39 @@ impl ProofHelperConfig {
         // Storage backend
         if let Ok(backend) = env::var("PROOF_HELPER_STORAGE_BACKEND") {
             self.storage.backend = match backend.to_lowercase().as_str() {
-                "dynamodb" => StorageBackend::DynamoDB,
+                // "dynamodb" => StorageBackend::DynamoDB,
+                "sqlite" => StorageBackend::SQLite,
                 _ => return Err(ConfigError::EnvError(format!("Invalid storage backend: {}", backend))),
             };
         }
         
         // DynamoDB configuration
-        if let Ok(table_name) = env::var("PROOF_HELPER_DYNAMODB_TABLE_NAME") {
-            let dynamodb_config = self.storage.dynamodb.get_or_insert_with(|| DynamoDbConfig {
-                table_name: String::new(),
-                region: "us-east-1".to_string(),
-                endpoint_url: None,
-                read_capacity: Some(5),
-                write_capacity: Some(5),
-            });
-            dynamodb_config.table_name = table_name;
-        }
+        // if let Ok(table_name) = env::var("PROOF_HELPER_DYNAMODB_BRANCH_TABLE_NAME") {
+        //     let dynamodb_config = self.storage.dynamodb.get_or_insert_with(Default::default);
+        //     dynamodb_config.branch_table_name = table_name;
+        // }
+
+        // if let Ok(table_name) = env::var("PROOF_HELPER_DYNAMODB_EARLIEST_BLOCK_NUMBER_TABLE_NAME") {
+        //     let dynamodb_config = self.storage.dynamodb.get_or_insert_with(Default::default);
+        //     dynamodb_config.earliest_block_number_table_name = table_name;
+        // }
         
-        if let Ok(region) = env::var("PROOF_HELPER_DYNAMODB_REGION") {
-            if let Some(dynamodb_config) = &mut self.storage.dynamodb {
-                dynamodb_config.region = region;
-            }
-        }
+        // if let Ok(region) = env::var("PROOF_HELPER_DYNAMODB_REGION") {
+        //     if let Some(dynamodb_config) = &mut self.storage.dynamodb {
+        //         dynamodb_config.region = region;
+        //     }
+        // }
         
-        if let Ok(endpoint_url) = env::var("PROOF_HELPER_DYNAMODB_ENDPOINT_URL") {
-            if let Some(dynamodb_config) = &mut self.storage.dynamodb {
-                dynamodb_config.endpoint_url = Some(endpoint_url);
-            }
+        // if let Ok(endpoint_url) = env::var("PROOF_HELPER_DYNAMODB_ENDPOINT_URL") {
+        //     if let Some(dynamodb_config) = &mut self.storage.dynamodb {
+        //         dynamodb_config.endpoint_url = Some(endpoint_url);
+        //     }
+        // }
+
+        // SQLite configuration
+        if let Ok(db_path) = env::var("PROOF_HELPER_SQLITE_DB_PATH") {
+            let sqlite_config = self.storage.sqlite.get_or_insert_default();
+            sqlite_config.db_path = db_path;
         }
         
         // Logging configuration
@@ -143,18 +159,18 @@ impl ProofHelperConfig {
     /// Validate configuration
     fn validate(&self) -> ConfigResult<()> {
         // Validate DynamoDB configuration if backend is DynamoDB
-        if self.storage.backend == StorageBackend::DynamoDB {
-            let dynamodb_config = self.storage.dynamodb.as_ref()
-                .ok_or_else(|| ConfigError::ValidationError("DynamoDB configuration required when backend is 'dynamodb'".to_string()))?;
+        // if self.storage.backend == StorageBackend::DynamoDB {
+            // let dynamodb_config = self.storage.dynamodb.as_ref()
+            //     .ok_or_else(|| ConfigError::ValidationError("DynamoDB configuration required when backend is 'dynamodb'".to_string()))?;
             
-            if dynamodb_config.table_name.is_empty() {
-                return Err(ConfigError::ValidationError("DynamoDB table name cannot be empty".to_string()));
-            }
+            // if dynamodb_config.table_name.is_empty() {
+            //     return Err(ConfigError::ValidationError("DynamoDB table name cannot be empty".to_string()));
+            // }
             
-            if dynamodb_config.region.is_empty() {
-                return Err(ConfigError::ValidationError("DynamoDB region cannot be empty".to_string()));
-            }
-        }
+            // if dynamodb_config.region.is_empty() {
+            //     return Err(ConfigError::ValidationError("DynamoDB region cannot be empty".to_string()));
+            // }
+        // }
         
         // Validate logging level
         match self.logging.level.to_lowercase().as_str() {
@@ -175,8 +191,9 @@ impl Default for ProofHelperConfig {
     fn default() -> Self {
         Self {
             storage: StorageConfig {
-                backend: StorageBackend::DynamoDB,
-                dynamodb: None,
+                backend: StorageBackend::SQLite,
+                // dynamodb: Default::default(),
+                sqlite: None,
             },
             logging: LoggingConfig {
                 level: "info".to_string(),
@@ -191,7 +208,8 @@ impl Default for ProofHelperConfig {
 impl Default for DynamoDbConfig {
     fn default() -> Self {
         Self {
-            table_name: "proof-helper-preimages".to_string(),
+            branch_table_name: "proof-helper-preimages".to_string(),
+            earliest_block_number_table_name: "proof-helper-preimages-earliest-block-number".to_string(),
             region: "us-east-1".to_string(),
             endpoint_url: None,
             read_capacity: Some(5),
@@ -200,72 +218,8 @@ impl Default for DynamoDbConfig {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_default_config() {
-        let config = ProofHelperConfig::default();
-        assert_eq!(config.storage.backend, StorageBackend::DynamoDB);
-        assert_eq!(config.logging.level, "info");
-        assert_eq!(config.processing.max_block_diff, 2000);
+impl Default for SqliteConfig {
+    fn default() -> Self {
+        Self { db_path: "proof-helper.db".to_string() }
     }
-    
-    #[test]
-    fn test_config_validation() {
-        let mut config = ProofHelperConfig::default();
-        
-        // Valid config should pass
-        assert!(config.validate().is_ok());
-        
-        // Invalid log level should fail
-        config.logging.level = "invalid".to_string();
-        assert!(config.validate().is_err());
-        
-        // Reset to valid
-        config.logging.level = "info".to_string();
-        
-        // DynamoDB without config should fail
-        config.storage.backend = StorageBackend::DynamoDB;
-        assert!(config.validate().is_err());
-        
-        // DynamoDB with empty table name should fail
-        config.storage.dynamodb = Some(DynamoDbConfig {
-            table_name: String::new(),
-            region: "us-east-1".to_string(),
-            endpoint_url: None,
-            read_capacity: Some(5),
-            write_capacity: Some(5),
-        });
-        assert!(config.validate().is_err());
-    }
-    
-    #[test]
-    fn test_env_overrides() {
-        // Set environment variables
-        unsafe {
-            env::set_var("PROOF_HELPER_STORAGE_BACKEND", "dynamodb");
-            env::set_var("PROOF_HELPER_DYNAMODB_TABLE_NAME", "test-table");
-            env::set_var("PROOF_HELPER_DYNAMODB_REGION", "us-west-2");
-            env::set_var("PROOF_HELPER_LOG_LEVEL", "debug");
-            env::set_var("PROOF_HELPER_MAX_BLOCK_DIFF", "500");
-        }
-        
-        let config = ProofHelperConfig::load_from_env().unwrap();
-        assert_eq!(config.storage.backend, StorageBackend::DynamoDB);
-        assert_eq!(config.storage.dynamodb.as_ref().unwrap().table_name, "test-table");
-        assert_eq!(config.storage.dynamodb.as_ref().unwrap().region, "us-west-2");
-        assert_eq!(config.logging.level, "debug");
-        assert_eq!(config.processing.max_block_diff, 500);
-        
-        // Clean up
-        unsafe {
-            env::remove_var("PROOF_HELPER_STORAGE_BACKEND");
-            env::remove_var("PROOF_HELPER_DYNAMODB_TABLE_NAME");
-            env::remove_var("PROOF_HELPER_DYNAMODB_REGION");
-            env::remove_var("PROOF_HELPER_LOG_LEVEL");
-            env::remove_var("PROOF_HELPER_MAX_BLOCK_DIFF");
-        }
-    }
-} 
+}

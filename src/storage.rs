@@ -1,15 +1,12 @@
-use std::collections::HashMap;
-
 use reth::revm::primitives::B256;
-use reth_trie::Nibbles;
+use reth_trie::{BranchNodeCompact, StoredNibbles};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PreimageEntry {
-    pub hash: B256,
-    pub preimage: Vec<u8>,
-    pub hashed_address: Option<B256>,
-    pub path: Nibbles,
     pub block_number: u64,
+    pub path: StoredNibbles,
+    pub hashed_address: Option<B256>,
+    pub branch: BranchNodeCompact
 }
 
 /// Batch of preimages to be stored together
@@ -34,6 +31,8 @@ pub enum PreimageStorageError {
     BatchError(String),
     #[error("Connection error: {0}")]
     ConnectionError(String),
+    #[error("Table creation error: {0}")]
+    TableCreationError(String),
 }
 
 /// Result type for storage operations
@@ -55,11 +54,10 @@ pub trait PreimageStore: Send + Sync {
     /// * `block_number` - Block number for secondary indexing and pruning
     async fn store_preimage(
         &self,
-        hash: B256,
-        preimage: Vec<u8>,
-        hashed_address: Option<B256>,
-        path: Nibbles,
         block_number: u64,
+        path: StoredNibbles,
+        hashed_address: Option<B256>,
+        branch: BranchNodeCompact,
     ) -> PreimageStorageResult<()>;
 
     /// Store multiple preimages in a batch operation
@@ -70,54 +68,9 @@ pub trait PreimageStore: Send + Sync {
     /// * `batch` - Batch of preimages to store
     async fn store_preimages_batch(&self, batch: PreimageBatch) -> PreimageStorageResult<()>;
 
-    /// Retrieve a preimage by its hash
-    /// 
-    /// # Arguments
-    /// * `hash` - Hash of the preimage to retrieve
-    async fn get_preimage(&self, hash: &B256) -> PreimageStorageResult<Option<Vec<u8>>>;
+    async fn get_earliest_block_number(&self) -> PreimageStorageResult<(u64, B256)>;
 
-    /// Retrieve multiple preimages by their hashes
-    /// 
-    /// # Arguments
-    /// * `hashes` - Vector of hashes to retrieve
-    /// 
-    /// # Returns
-    /// * HashMap with found preimages (missing items are not included)
-    async fn get_preimages_batch(
-        &self,
-        hashes: &[B256],
-    ) -> PreimageStorageResult<HashMap<B256, Vec<u8>>>;
-
-    /// Check if a preimage exists
-    /// 
-    /// # Arguments
-    /// * `hash` - Hash to check for existence
-    async fn exists(&self, hash: &B256) -> PreimageStorageResult<bool>;
-
-    /// Prune preimages older than the specified block number
-    /// 
-    /// This uses the secondary index on block number for efficient pruning
-    /// 
-    /// # Arguments
-    /// * `before_block` - Remove preimages from blocks before this number
-    /// 
-    /// # Returns
-    /// * Number of items deleted
-    async fn prune_before_block(&self, before_block: u64) -> PreimageStorageResult<u64>;
-
-    /// Get the count of stored preimages for a specific block
-    /// 
-    /// # Arguments
-    /// * `block_number` - Block number to count preimages for
-    async fn count_preimages_for_block(&self, block_number: u64) -> PreimageStorageResult<u64>;
-
-    /// Get all preimage hashes for a specific block
-    /// 
-    /// Useful for verification or debugging
-    /// 
-    /// # Arguments
-    /// * `block_number` - Block number to get hashes for
-    async fn get_hashes_for_block(&self, block_number: u64) -> PreimageStorageResult<Vec<B256>>;
+    async fn set_earliest_block_number(&self, block_number: u64, hash: B256) -> PreimageStorageResult<()>;
 
     /// Health check for the storage backend
     async fn health_check(&self) -> PreimageStorageResult<()>;

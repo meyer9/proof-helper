@@ -15,6 +15,7 @@ reth-db-api = { git = "https://github.com/paradigmxyz/reth.git" }
 reth-execution-types = { git = "https://github.com/paradigmxyz/reth.git" }
 reth-evm = { git = "https://github.com/paradigmxyz/reth.git" }
 reth-stateless = { git = "https://github.com/paradigmxyz/reth.git" }
+reth-codecs = { git = "https://github.com/paradigmxyz/reth.git" }
 alloy-rlp = "0.3.12"
 
 eyre = "0.6" # Easy error handling
@@ -28,6 +29,7 @@ aws-config = "1.1"
 aws-sdk-dynamodb = "1.11"
 aws-smithy-runtime-api = "1.1"
 hex = "0.4"
+rusqlite = { version = "0.31", features = ["bundled", "functions", "blob"] }
 
 [dev-dependencies]
 tempfile = "3.0"

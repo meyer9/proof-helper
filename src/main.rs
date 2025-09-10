@@ -2,32 +2,22 @@ use futures_util::TryStreamExt;
 use op_reth::node::OpNode;
 use op_reth::primitives::OpPrimitives;
 use reth::{
-    api::{ConfigureEvm, FullNodeComponents, NodePrimitives},
+    api::{FullNodeComponents},
     builder::NodeTypes,
-    core::primitives::AlloyBlockHeader,
-    primitives::RecoveredBlock,
-    providers::{BlockReader, StateProviderFactory, StateReader, TransactionVariant},
-    revm::{
-        database::StateProviderDatabase,
-        primitives::{
-            keccak256,
-            map::{B256Map, B256Set},
-        },
-    },
+    providers::{DBProvider, DatabaseProviderFactory, StateReader},
 };
-use reth_evm::execute::Executor;
+use reth_db_api::{cursor::{DbCursorRO, DbDupCursorRO}, tables, transaction::DbTx};
 use reth_exex::{ExExContext, ExExEvent, ExExNotification};
 use reth_tracing::tracing::{info, warn};
-use reth_trie::TrieInput;
-use reth_trie::{HashedPostState, KeccakKeyHasher};
+use reth_trie::{StoredNibbles};
 use std::sync::Arc;
 
 mod config;
-mod dynamodb;
+mod sqlite;
 mod storage;
 
 use config::{ProofHelperConfig, StorageBackend};
-use dynamodb::DynamoDbPreimageStore;
+use sqlite::SqlitePreimageStore;
 use storage::{PreimageBatch, PreimageEntry, PreimageStore};
 
 /// Proof Helper ExEx - processes blocks and tracks state changes
@@ -43,139 +33,145 @@ where
 impl<Node> ProofHelper<Node>
 where
     Node: FullNodeComponents<Types: NodeTypes<Primitives = OpPrimitives>>,
-    Node::Provider: StateReader + StateProviderFactory + BlockReader,
 {
     /// Create a new ProofHelper instance
     pub fn new(ctx: ExExContext<Node>, storage: Arc<dyn PreimageStore>) -> Self {
         Self { ctx, storage }
     }
 
-    fn process_block(
-        &self,
-        block: &RecoveredBlock<<<Node::Types as NodeTypes>::Primitives as NodePrimitives>::Block>,
-    ) -> eyre::Result<()> {
-        let block_number = block.header().number();
-        let parent_hash = block.header().parent_hash();
-        let state_provider = self.ctx.provider().history_by_block_hash(parent_hash)?;
+    async fn backfill_accounts_trie(&self) -> eyre::Result<()> {
+        let db_provider = self.ctx.provider().database_provider_ro()?;
+        let db = db_provider.tx_ref();
 
-        let db = StateProviderDatabase::new(&state_provider);
-        let block_executor = self.ctx.evm_config().batch_executor(db);
+        // count entries in AccountsTrie and StorageTrie
+        let mut accounts_trie_cursor = db.cursor_read::<tables::AccountsTrie>()?;
 
-        let execution_result = block_executor
-            .execute(&(*block).clone())
-            .map_err(|err| eyre::eyre!(err))?;
+        let mut entry = accounts_trie_cursor.first()?;
+        let mut batch: PreimageBatch = PreimageBatch::new(0);
 
-        let hashed_state =
-            HashedPostState::from_bundle_state::<KeccakKeyHasher>(execution_result.state.state());
-
-        let mut targets = B256Map::<B256Set>::with_capacity_and_hasher(
-            hashed_state.storages.len(),
-            Default::default(),
-        );
-
-        for (address, storage) in hashed_state.storages.iter() {
-            let set = targets.entry(address.clone()).or_default();
-            for (slot, _) in storage.storage.iter() {
-                set.insert(slot.clone());
-            }
-        }
-
-        // for addresses, ensure that the key exists, otherwise insert an empty set
-        for (address, _) in hashed_state.accounts.iter() {
-            targets.entry(address.clone()).or_default();
-        }
-
-        // prove all the changed keys
-        let multiproof = state_provider.multiproof(
-            TrieInput::from_state(hashed_state),
-            targets.into_iter().collect(),
-        )?;
-
-        let mut preimages = Vec::new();
-
-        for (nibbles, data) in multiproof.account_subtree.iter() {
-            let hash = keccak256(data);
-
-            preimages.push(PreimageEntry {
-                hash: hash,
-                preimage: data.to_vec(),
-                hashed_address: None,
-                path: nibbles.clone(),
-                block_number: block_number,
-            });
-        }
-
-        for (account_hash, storage_multiproof) in multiproof.storages.iter() {
-            for (nibbles, data) in storage_multiproof.subtree.iter() {
-                let hash = keccak256(data);
-
-                preimages.push(PreimageEntry {
-                    hash: hash,
-                    preimage: data.to_vec(),
-                    hashed_address: Some(account_hash.clone()),
-                    path: nibbles.clone(),
-                    block_number: block_number,
+        let mut count = 0;
+        loop {
+            if let Some(entry) = entry {
+                // let key = entry.0;
+                // let value = entry.1;
+                batch.items.push(PreimageEntry {
+                    block_number: 0,
+                    path: entry.0,
+                    hashed_address: None,
+                    branch: entry.1,
                 });
+                count += 1;
+            } else {
+                break;
             }
+
+            if count % 10000 == 0 {
+                info!("AccountsTrie has {} entries", count);
+                self.storage.store_preimages_batch(batch).await?;
+                batch = PreimageBatch::new(0);
+            }
+
+            entry = accounts_trie_cursor.next()?;
         }
 
-        // Store the batch
-        let storage_clone = Arc::clone(&self.storage);
-        tokio::spawn(async move {
-            if let Err(e) = storage_clone
-                .store_preimages_batch(PreimageBatch {
-                    block_number: block_number,
-                    items: preimages.clone(),
-                })
-                .await
-            {
-                warn!(
-                    "Failed to store preimages for block {}: {}",
-                    block_number, e
-                );
-            } else {
-                info!(
-                    "Successfully stored {} preimages for block {}",
-                    preimages.len(),
-                    block_number
-                );
-            }
-        });
+        if batch.items.len() > 0 {
+            self.storage.store_preimages_batch(batch).await?;
+        }
+
+        info!("AccountsTrie has {} entries", count);
 
         Ok(())
     }
 
+    async fn backfill_storages_trie(&self) -> eyre::Result<()> {
+        let db_provider = self.ctx.provider().database_provider_ro()?;
+        let db = db_provider.tx_ref();
+
+        // count entries in AccountsTrie and StorageTrie
+        let mut hashed_storages_cursor = db.cursor_dup_read::<tables::HashedStorages>()?;
+        let mut storages_trie_cursor = db.cursor_dup_read::<tables::StoragesTrie>()?;
+
+        let mut storage_entry = hashed_storages_cursor.first()?;
+        let mut batch: PreimageBatch = PreimageBatch::new(0);
+        let mut count = 0;
+        loop {
+            if let Some(storage_entry) = storage_entry {
+                let address = storage_entry.0;
+
+                let mut address_count = 0;
+
+                // save all the entries for this address
+                let account_entry = storages_trie_cursor.walk_dup(Some(address), None)?;
+                for res in account_entry {
+                    let Ok((account, branch)) = res else {
+                        warn!("Error walking account entry: {}", res.err().unwrap());
+                        break;
+                    };
+
+                    if account != address {
+                        warn!("Account address mismatch: {} != {}", account, address);
+                        break;
+                    }
+
+                    batch.items.push(PreimageEntry {
+                        block_number: 0,
+                        path: StoredNibbles(branch.nibbles.0),
+                        hashed_address: Some(account),
+                        branch: branch.node,
+                    });
+
+                    if count % 10000 == 0 {
+                        info!("StoragesTrie has {} entries", count);
+                        self.storage.store_preimages_batch(batch).await?;
+                        batch = PreimageBatch::new(0);
+                    }
+
+                    address_count += 1;
+                }
+
+                info!("StoragesTrie has {} entries for address {}", address_count, address);
+
+                count += address_count;
+            } else {
+                break;
+            }
+
+
+            storage_entry = hashed_storages_cursor.next_no_dup()?;
+        }
+        info!("StoragesTrie has {} entries", count);
+
+        if batch.items.len() > 0 {
+            self.storage.store_preimages_batch(batch).await?;
+        }
+
+        Ok(())
+    }
+
+
+    async fn backfill_preimages(&self) -> eyre::Result<()> {
+        self.backfill_storages_trie().await?;
+        self.backfill_accounts_trie().await?;
+        Ok(())
+    }
+
+    // fn process_block(
+    //     &self,
+    //     block: &RecoveredBlock<<<Node::Types as NodeTypes>::Primitives as NodePrimitives>::Block>,
+    // ) -> eyre::Result<()> {
+    //     // TODO: Implement this
+
+    //     Ok(())
+    // }
+
     /// Main execution loop for the ExEx
-    pub async fn run(mut self, config: ProofHelperConfig) -> eyre::Result<()> {
-        let max_block_diff = config.processing.max_block_diff;
+    pub async fn run(mut self, _config: ProofHelperConfig) -> eyre::Result<()> {
+        self.backfill_preimages().await?;
 
         while let Some(notification) = self.ctx.notifications.try_next().await? {
             match &notification {
-                ExExNotification::ChainCommitted { new } => {
-                    let head_block_number = new.tip().num_hash().number;
-
-                    for (block_number, block) in new.blocks() {
-                        if head_block_number.saturating_sub(*block_number) > max_block_diff {
-                            warn!(
-                                "Block {} is too far behind the head block {}, skipping",
-                                block_number, head_block_number
-                            );
-                            continue;
-                        }
-
-                        let Some(parent_block) = self.ctx.provider().recovered_block(
-                            block.header().parent_hash().into(),
-                            TransactionVariant::NoHash,
-                        )?
-                        else {
-                            warn!("Parent block not found for block {}", block_number);
-                            continue;
-                        };
-
-                        if let Err(err) = self.process_block(&parent_block) {
-                            warn!("Error processing block {}: {}", block_number, err);
-                        }
-                    }
+                ExExNotification::ChainCommitted { .. } => {
+                    // TODO: store storage updates when we get them
                 }
                 _ => {}
             };
@@ -195,23 +191,22 @@ where
 /// Create storage backend based on configuration
 async fn create_storage(config: &ProofHelperConfig) -> eyre::Result<Arc<dyn PreimageStore>> {
     match config.storage.backend {
-        StorageBackend::DynamoDB => {
-            info!("Using DynamoDB storage backend");
-            let dynamodb_config = config.storage.dynamodb.as_ref().ok_or_else(|| {
-                eyre::eyre!("DynamoDB configuration is required when using DynamoDB backend")
-            })?;
+        StorageBackend::SQLite => {
+            info!("Using SQLite storage backend");
+            let sqlite_cfg = config
+                .storage
+                .sqlite
+                .as_ref()
+                .ok_or_else(|| eyre::eyre!("SQLite configuration is required when using SQLite backend"))?;
 
-            let store = DynamoDbPreimageStore::new(dynamodb_config)
+            let store = SqlitePreimageStore::new(&sqlite_cfg.db_path)
                 .await
-                .map_err(|e| eyre::eyre!("Failed to create DynamoDB store: {}", e))?;
-
-            // Run health check to ensure connection is working
+                .map_err(|e| eyre::eyre!("Failed to create SQLite store: {}", e))?;
             store
                 .health_check()
                 .await
-                .map_err(|e| eyre::eyre!("DynamoDB health check failed: {}", e))?;
-
-            info!("DynamoDB store initialized successfully");
+                .map_err(|e| eyre::eyre!("SQLite health check failed: {}", e))?;
+            info!("SQLite store initialized successfully");
             Ok(Arc::new(store))
         }
     }
