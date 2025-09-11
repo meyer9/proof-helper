@@ -120,8 +120,8 @@ where
                         branch: branch.node,
                     });
 
-                    if count % 10000 == 0 {
-                        info!("StoragesTrie has {} entries", count);
+                    if (count + address_count) % 10000 == 0 {
+                        info!("StoragesTrie has {} entries", count + address_count);
                         self.storage.store_preimages_batch(batch).await?;
                         batch = PreimageBatch::new(0);
                     }
@@ -129,8 +129,10 @@ where
                     address_count += 1;
                 }
 
-                info!("StoragesTrie has {} entries for address {}", address_count, address);
-
+                if address_count > 100 {
+                    info!("StoragesTrie has {} entries for address {}", address_count, address);
+                }
+                    
                 count += address_count;
             } else {
                 break;
