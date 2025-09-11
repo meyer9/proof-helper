@@ -87,7 +87,7 @@ impl PreimageStore for SqlitePreimageStore {
         block_number: u64,
         path: StoredNibbles,
         hashed_address: Option<B256>,
-        branch: BranchNodeCompact,
+        branch: Option<BranchNodeCompact>,
     ) -> PreimageStorageResult<()> {
         let mut conn = self.connect()?;
         let tx = conn
@@ -97,7 +97,10 @@ impl PreimageStore for SqlitePreimageStore {
         let key = Self::build_key(&hashed_address, &path, block_number);
         let mut path_bytes = Vec::new();
         path.to_compact(&mut path_bytes);
-        let branch_bytes = Self::encode_branch(&branch)?;
+        let branch_bytes = match branch {
+            Some(branch) => Self::encode_branch(&branch)?,
+            None => Vec::new(),
+        };
 
         tx.execute(
             "INSERT OR REPLACE INTO branch_nodes (key, hashed_address, path, block_number, branch) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -126,7 +129,10 @@ impl PreimageStore for SqlitePreimageStore {
             let key = Self::build_key(&item.hashed_address, &item.path, item.block_number);
             let mut path_bytes = Vec::new();
             item.path.to_compact(&mut path_bytes);
-            let branch_bytes = Self::encode_branch(&item.branch)?;
+            let branch_bytes = match item.branch {
+                Some(branch) => Self::encode_branch(&branch)?,
+                None => Vec::new(),
+            };
 
             tx.execute(
                 "INSERT OR REPLACE INTO branch_nodes (key, hashed_address, path, block_number, branch) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -145,7 +151,7 @@ impl PreimageStore for SqlitePreimageStore {
         Ok(())
     }
 
-    async fn get_earliest_block_number(&self) -> PreimageStorageResult<(u64, B256)> {
+    async fn get_earliest_block_number(&self) -> PreimageStorageResult<Option<(u64, B256)>> {
         let conn = self.connect()?;
         let row: Option<(i64, Vec<u8>)> = conn
             .query_row(
@@ -160,9 +166,9 @@ impl PreimageStore for SqlitePreimageStore {
             let mut h = [0u8; 32];
             let len = hash_bytes.len().min(32);
             h[..len].copy_from_slice(&hash_bytes[..len]);
-            Ok((bn as u64, B256::from_slice(&h)))
+            Ok(Some((bn as u64, B256::from_slice(&h))))
         } else {
-            Ok((0, B256::ZERO))
+            Ok(None)
         }
     }
 

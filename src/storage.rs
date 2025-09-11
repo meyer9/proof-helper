@@ -6,7 +6,7 @@ pub struct PreimageEntry {
     pub block_number: u64,
     pub path: StoredNibbles,
     pub hashed_address: Option<B256>,
-    pub branch: BranchNodeCompact
+    pub branch: Option<BranchNodeCompact>,
 }
 
 /// Batch of preimages to be stored together
@@ -46,7 +46,8 @@ pub type PreimageStorageResult<T> = Result<T, PreimageStorageError>;
 /// Storage model: hash (primary key) -> preimage data, with block_number as secondary index
 #[async_trait::async_trait]
 pub trait PreimageStore: Send + Sync {
-    /// Store a single preimage
+    /// Store a single preimage. Storing None will store a NULL value which will be used to 
+    /// signal that the preimage was deleted at that block.
     /// 
     /// # Arguments
     /// * `hash` - Hash of the preimage (used as primary key)
@@ -57,7 +58,7 @@ pub trait PreimageStore: Send + Sync {
         block_number: u64,
         path: StoredNibbles,
         hashed_address: Option<B256>,
-        branch: BranchNodeCompact,
+        branch: Option<BranchNodeCompact>,
     ) -> PreimageStorageResult<()>;
 
     /// Store multiple preimages in a batch operation
@@ -68,7 +69,7 @@ pub trait PreimageStore: Send + Sync {
     /// * `batch` - Batch of preimages to store
     async fn store_preimages_batch(&self, batch: PreimageBatch) -> PreimageStorageResult<()>;
 
-    async fn get_earliest_block_number(&self) -> PreimageStorageResult<(u64, B256)>;
+    async fn get_earliest_block_number(&self) -> PreimageStorageResult<Option<(u64, B256)>>;
 
     async fn set_earliest_block_number(&self, block_number: u64, hash: B256) -> PreimageStorageResult<()>;
 

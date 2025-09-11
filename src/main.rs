@@ -1,15 +1,13 @@
 use futures_util::TryStreamExt;
 use op_reth::node::OpNode;
-use op_reth::primitives::OpPrimitives;
 use reth::{
-    api::{FullNodeComponents},
-    builder::NodeTypes,
-    providers::{DBProvider, DatabaseProviderFactory, StateReader},
+    api::{FullNodeComponents, NodePrimitives}, builder::NodeTypes, chainspec::ChainInfo, core::primitives::AlloyBlockHeader, primitives::RecoveredBlock, providers::{BlockNumReader, DBProvider, DatabaseProviderFactory, StateReader}, revm::primitives::{map::FbBuildHasher, FixedBytes, HashMap}
 };
+
 use reth_db_api::{cursor::{DbCursorRO, DbDupCursorRO}, tables, transaction::DbTx};
 use reth_exex::{ExExContext, ExExEvent, ExExNotification};
 use reth_tracing::tracing::{info, warn};
-use reth_trie::{StoredNibbles};
+use reth_trie::{updates::{StorageTrieUpdates, TrieUpdates}, StoredNibbles};
 use std::sync::Arc;
 
 mod config;
@@ -30,9 +28,10 @@ where
     storage: Arc<dyn PreimageStore>,
 }
 
-impl<Node> ProofHelper<Node>
+impl<Node, Primitives> ProofHelper<Node>
 where
-    Node: FullNodeComponents<Types: NodeTypes<Primitives = OpPrimitives>>,
+    Node: FullNodeComponents<Types: NodeTypes<Primitives = Primitives>>,
+    Primitives: NodePrimitives,
 {
     /// Create a new ProofHelper instance
     pub fn new(ctx: ExExContext<Node>, storage: Arc<dyn PreimageStore>) -> Self {
@@ -58,7 +57,7 @@ where
                     block_number: 0,
                     path: entry.0,
                     hashed_address: None,
-                    branch: entry.1,
+                    branch: Some(entry.1),
                 });
                 count += 1;
             } else {
@@ -117,7 +116,7 @@ where
                         block_number: 0,
                         path: StoredNibbles(branch.nibbles.0),
                         hashed_address: Some(account),
-                        branch: branch.node,
+                        branch: Some(branch.node),
                     });
 
                     if (count + address_count) % 10000 == 0 {
@@ -154,26 +153,111 @@ where
     async fn backfill_preimages(&self) -> eyre::Result<()> {
         self.backfill_storages_trie().await?;
         self.backfill_accounts_trie().await?;
+        let ChainInfo { best_number, best_hash } = self.ctx.provider().chain_info().unwrap();
+        self.storage.set_earliest_block_number(best_number, best_hash).await?;
         Ok(())
     }
 
-    // fn process_block(
-    //     &self,
-    //     block: &RecoveredBlock<<<Node::Types as NodeTypes>::Primitives as NodePrimitives>::Block>,
-    // ) -> eyre::Result<()> {
-    //     // TODO: Implement this
+    async fn write_storage_trie_updates(&self, account_storage_updates: &HashMap<FixedBytes<32>, StorageTrieUpdates, FbBuildHasher<32>>, block_number: u64) -> eyre::Result<u64> {
+        let mut num_entries = 0;
+        let mut preimage_batch = PreimageBatch::new(block_number);
+        for (hashed_address, updates) in account_storage_updates {
+            // The storage trie for this account has to be deleted.
+            if updates.is_deleted() {
+                // TODO: delete all storage trie entries for this account
+            }
 
-    //     Ok(())
-    // }
+            // Merge updated and removed nodes. Updated nodes must take precedence.
+            let mut storage_updates = updates
+                .removed_nodes_ref()
+                .iter()
+                .filter_map(|n| (!updates.storage_nodes_ref().contains_key(n)).then_some((n, None)))
+                .collect::<Vec<_>>();
+            storage_updates.extend(
+                updates.storage_nodes_ref().iter().map(|(nibbles, node)| (nibbles, Some(node))),
+            );
+            for (nibbles, maybe_updated) in storage_updates.into_iter().filter(|(n, _)| !n.is_empty()) {
+                num_entries += 1;
+                preimage_batch.items.push(PreimageEntry {
+                    block_number,
+                    path: StoredNibbles(*nibbles),
+                    hashed_address: Some(*hashed_address),
+                    branch: maybe_updated.map(|node| node.clone()),
+                });
+            }
+        }
+
+        self.storage.store_preimages_batch(preimage_batch).await?;
+
+        Ok(num_entries)
+    }
+
+    async fn write_trie_updates(&self, trie_updates: &TrieUpdates, block: &RecoveredBlock<Primitives::Block>) -> eyre::Result<u64> {
+        // if no earliest block is set, start a backfill job
+        let earliest_block = self.storage.get_earliest_block_number().await?;
+        if earliest_block.is_none() {
+            self.backfill_preimages().await?;
+        }
+
+        // Track the number of inserted entries.
+        let mut num_entries = 0;
+
+        // Merge updated and removed nodes. Updated nodes must take precedence.
+        let mut account_updates = trie_updates
+            .removed_nodes_ref()
+            .iter()
+            .filter_map(|n| {
+                (!trie_updates.account_nodes_ref().contains_key(n)).then_some((n, None))
+            })
+            .collect::<Vec<_>>();
+        account_updates.extend(
+            trie_updates.account_nodes_ref().iter().map(|(nibbles, node)| (nibbles, Some(node))),
+        );
+        // Sort trie node updates.
+        account_updates.sort_unstable_by(|a, b| a.0.cmp(b.0));
+
+        let mut batch_to_store = PreimageBatch::new(block.number());
+
+        for (key, updated_node) in account_updates {
+            let nibbles = StoredNibbles(*key);
+            match updated_node {
+                Some(node) => {
+                    if !nibbles.0.is_empty() {
+                        num_entries += 1;
+                        batch_to_store.items.push(PreimageEntry {
+                            block_number: block.number(),
+                            path: nibbles,
+                            hashed_address: None,
+                            branch: Some(node.clone()),
+                        });
+                    }
+                }
+                None => {
+                    num_entries += 1;
+                    batch_to_store.items.push(PreimageEntry {
+                        block_number: block.number(),
+                        path: nibbles,
+                        hashed_address: None,
+                        branch: None,
+                    });
+                }
+            }
+        }
+
+        self.storage.store_preimages_batch(batch_to_store).await?;
+        num_entries += self.write_storage_trie_updates(trie_updates.storage_tries_ref(), block.number()).await?;
+
+        Ok(num_entries)
+    }
 
     /// Main execution loop for the ExEx
     pub async fn run(mut self, _config: ProofHelperConfig) -> eyre::Result<()> {
-        self.backfill_preimages().await?;
-
         while let Some(notification) = self.ctx.notifications.try_next().await? {
             match &notification {
-                ExExNotification::ChainCommitted { .. } => {
-                    // TODO: store storage updates when we get them
+                ExExNotification::ChainCommitted { new } => {
+                    if let Some(trie_updates) = new.trie_updates() {
+                        self.write_trie_updates(trie_updates, new.tip()).await?;
+                    }
                 }
                 _ => {}
             };
