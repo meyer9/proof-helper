@@ -13,10 +13,13 @@ use std::sync::Arc;
 mod config;
 mod sqlite;
 mod storage;
+mod rpc;
 
 use config::{ProofHelperConfig, StorageBackend};
 use sqlite::SqlitePreimageStore;
 use storage::{PreimageBatch, PreimageEntry, PreimageStore};
+
+use crate::rpc::{EthApiExt, EthApiOverrideServer};
 
 /// Proof Helper ExEx - processes blocks and tracks state changes
 pub struct ProofHelper<Node>
@@ -252,6 +255,10 @@ where
 
     /// Main execution loop for the ExEx
     pub async fn run(mut self, _config: ProofHelperConfig) -> eyre::Result<()> {
+        if self.storage.get_earliest_block_number().await? == None {
+            self.backfill_preimages().await?;
+        }
+
         while let Some(notification) = self.ctx.notifications.try_next().await? {
             match &notification {
                 ExExNotification::ChainCommitted { new } => {
@@ -303,17 +310,33 @@ fn main() -> eyre::Result<()> {
     let config = ProofHelperConfig::load_from_env()
         .map_err(|e| eyre::eyre!("Failed to load configuration: {}", e))?;
 
+    // run get_storage and wait for it to complete
+    let storage = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            create_storage(&config)
+            .await
+            .map_err(|e| eyre::eyre!("Failed to create storage backend: {}", e))
+        })?;
+
+    let storage_2 = storage.clone();
+
     op_reth::cli::Cli::parse_args().run(async move |builder, _| {
         let handle = builder
             .node(OpNode::default())
             .install_exex("proof-helper", async move |ctx| {
-                // Create storage backend based on configuration
-                let storage = create_storage(&config)
-                    .await
-                    .map_err(|e| eyre::eyre!("Failed to create storage backend: {}", e))?;
+
+                // let builder = ctx.components.payload_builder_handle();
 
                 let proof_helper = ProofHelper::new(ctx, storage);
                 Ok(proof_helper.run(config))
+            })
+            .extend_rpc_modules(move |ctx| {
+                let api_ext = EthApiExt::new(ctx.registry.eth_api().clone(), storage_2);
+                ctx.modules.replace_configured(api_ext.into_rpc())?;
+                Ok(()) 
             })
             .launch()
             .await?;

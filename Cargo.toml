@@ -18,6 +18,13 @@ reth-stateless = { git = "https://github.com/paradigmxyz/reth.git" }
 reth-codecs = { git = "https://github.com/paradigmxyz/reth.git" }
 alloy-rlp = "0.3.12"
 
+op-alloy-rpc-jsonrpsee = { version = "0.19.0", default-features = false }
+op-alloy-network = { version = "0.19.0", default-features = false }
+
+jsonrpsee = "0.26.0"
+jsonrpsee-core = "0.26.0"
+jsonrpsee-types = "0.26.0"
+
 eyre = "0.6" # Easy error handling
 futures-util = "0.3" # Stream utilities for consuming notifications
 thiserror = "2.0"

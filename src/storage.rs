@@ -1,5 +1,6 @@
 use reth::revm::primitives::B256;
 use reth_trie::{BranchNodeCompact, StoredNibbles};
+use std::fmt::Debug;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PreimageEntry {
@@ -45,7 +46,7 @@ pub type PreimageStorageResult<T> = Result<T, PreimageStorageError>;
 /// 
 /// Storage model: hash (primary key) -> preimage data, with block_number as secondary index
 #[async_trait::async_trait]
-pub trait PreimageStore: Send + Sync {
+pub trait PreimageStore: Send + Sync + Debug {
     /// Store a single preimage. Storing None will store a NULL value which will be used to 
     /// signal that the preimage was deleted at that block.
     /// 

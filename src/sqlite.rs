@@ -53,30 +53,89 @@ impl SqlitePreimageStore {
             );
             "#,
         ).map_err(|e| PreimageStorageError::TableCreationError(format!("Failed to create schema: {}", e)))?;
+
         Ok(())
     }
-
-    /// Build the compound key as <hashed_address_optional> ++ <path> ++ <block_number>.
-    /// - hashed_address_optional: 32 bytes if Some, 0 bytes if None
-    /// - path: compact bytes representation from StoredNibbles
-    /// - block_number: 8-byte big-endian
-    fn build_key(hashed_address: &Option<B256>, path: &StoredNibbles, block_number: u64) -> Vec<u8> {
-        let mut path_bytes = Vec::new();
-        let path_len = path.to_compact(&mut path_bytes);
-        let mut key = Vec::with_capacity(32 + path_len + 8);
-        if let Some(addr) = hashed_address {
-            key.extend_from_slice(addr.as_slice());
-        }
-        key.extend_from_slice(&path_bytes);
-        key.extend_from_slice(&block_number.to_be_bytes());
-        key
-    }
-
     fn encode_branch(branch: &BranchNodeCompact) -> PreimageStorageResult<Vec<u8>> {
         let mut out = Vec::new();
         branch
             .to_compact(&mut out);
         Ok(out)
+    }
+}
+
+/// Key codec for branch nodes implementing Option B layout.
+///
+/// Format:
+/// - If `hashed_address` is Some(addr):
+///     <addr(32)> <len_with_flag(1, MSB=1)> <path(len)> <block_number(8, BE)>
+/// - If `hashed_address` is None:
+///     <len_with_flag(1, MSB=0)> <path(len)> <block_number(8, BE)>
+#[derive(Debug, Clone)]
+struct BranchNodeKey {
+    hashed_address: Option<B256>,
+    path: StoredNibbles,
+    block_number: u64,
+}
+
+impl BranchNodeKey {
+    fn encode(&self) -> Vec<u8> {
+        let mut path_bytes = Vec::new();
+        let path_len = self.path.to_compact(&mut path_bytes);
+
+        // 1-byte len header plus optional 32-byte address and 8 bytes block number
+        let capacity = (if self.hashed_address.is_some() { 32 } else { 0 }) + 1 + path_len + 8;
+        let mut out = Vec::with_capacity(capacity);
+
+        if let Some(addr) = &self.hashed_address {
+            out.extend_from_slice(addr.as_slice());
+            out.push(0x80 | (path_len as u8));
+        } else {
+            out.push(path_len as u8);
+        }
+        out.extend_from_slice(&path_bytes);
+        out.extend_from_slice(&self.block_number.to_be_bytes());
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> PreimageStorageResult<(Option<B256>, StoredNibbles, u64)> {
+        if bytes.len() < 1 + 8 {
+            return Err(PreimageStorageError::StorageError("key too short".to_string()));
+        }
+        let total_len = bytes.len();
+        let block_offset = total_len - 8;
+        let block_number = u64::from_be_bytes(bytes[block_offset..].try_into().unwrap());
+
+        // Try address-present case first
+        if total_len >= 32 + 1 + 8 {
+            let header = bytes[32];
+            if header & 0x80 == 0x80 {
+                let path_len = (header & 0x7f) as usize;
+                let expected = 32 + 1 + path_len + 8;
+                if expected == total_len {
+                    let addr = B256::from_slice(&bytes[0..32]);
+                    let path_start = 33;
+                    let path_end = path_start + path_len;
+                    let (path, _) = StoredNibbles::from_compact(&bytes[path_start..path_end], path_len);
+                    return Ok((Some(addr), path, block_number));
+                }
+            }
+        }
+
+        // Fallback: no address case
+        let header = bytes[0];
+        if header & 0x80 != 0 {
+            return Err(PreimageStorageError::StorageError("invalid key header for no-address variant".to_string()));
+        }
+        let path_len = header as usize;
+        let expected = 1 + path_len + 8;
+        if expected != total_len {
+            return Err(PreimageStorageError::StorageError("key length mismatch".to_string()));
+        }
+        let path_start = 1;
+        let path_end = path_start + path_len;
+        let (path, _) = StoredNibbles::from_compact(&bytes[path_start..path_end], path_len);
+        Ok((None, path, block_number))
     }
 }
 
@@ -94,7 +153,7 @@ impl PreimageStore for SqlitePreimageStore {
             .transaction()
             .map_err(|e| PreimageStorageError::StorageError(format!("Begin tx failed: {}", e)))?;
 
-        let key = Self::build_key(&hashed_address, &path, block_number);
+        let key = BranchNodeKey { hashed_address: hashed_address.clone(), path: path.clone(), block_number }.encode();
         let mut path_bytes = Vec::new();
         path.to_compact(&mut path_bytes);
         let branch_bytes = match branch {
@@ -125,8 +184,7 @@ impl PreimageStore for SqlitePreimageStore {
             .map_err(|e| PreimageStorageError::StorageError(format!("Begin tx failed: {}", e)))?;
 
         for item in batch.items.into_iter() {
-
-            let key = Self::build_key(&item.hashed_address, &item.path, item.block_number);
+            let key = BranchNodeKey { hashed_address: item.hashed_address.clone(), path: item.path.clone(), block_number: item.block_number }.encode();
             let mut path_bytes = Vec::new();
             item.path.to_compact(&mut path_bytes);
             let branch_bytes = match item.branch {
@@ -191,4 +249,31 @@ impl PreimageStore for SqlitePreimageStore {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    fn nibbles_from(vec: Vec<u8>) -> StoredNibbles { StoredNibbles::from(vec) }
+
+    #[test]
+    fn branch_node_key_roundtrip_no_address() {
+        let path = nibbles_from(vec![1, 2, 3, 4, 5]);
+        let key = BranchNodeKey { hashed_address: None, path: path.clone(), block_number: 42 }.encode();
+        let (addr, decoded_path, block) = BranchNodeKey::decode(&key).unwrap();
+        assert!(addr.is_none());
+        assert_eq!(decoded_path, path);
+        assert_eq!(block, 42);
+    }
+
+    #[test]
+    fn branch_node_key_roundtrip_with_address() {
+        let path = nibbles_from((0..32).map(|i| (i % 16) as u8).collect());
+        let addr = B256::repeat_byte(0xAB);
+        let bn = u64::MAX - 1234;
+        let key = BranchNodeKey { hashed_address: Some(addr), path: path.clone(), block_number: bn }.encode();
+        let (addr2, decoded_path, bn2) = BranchNodeKey::decode(&key).unwrap();
+        assert_eq!(addr2, Some(addr));
+        assert_eq!(decoded_path, path);
+        assert_eq!(bn2, bn);
+    }
+}
