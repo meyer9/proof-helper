@@ -1,12 +1,89 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::{Mutex, RwLock}};
 
 use reth::revm::primitives::B256;
 use reth_codecs::Compact;
 use reth_tracing::tracing::{info};
-use reth_trie::{BranchNodeCompact, StoredNibbles};
-use rusqlite::{params, Connection, OptionalExtension};
+use reth_trie::{BranchNodeCompact, Nibbles, StoredNibbles};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 
-use crate::storage::{PreimageBatch, PreimageStore, PreimageStorageError, PreimageStorageResult};
+use crate::storage::{PreimageBatch, PreimageStorageError, PreimageStorageResult, PreimageStore, PreimageStoreCursor};
+
+pub struct SqlitePreimageStoreCursor {
+    conn: Mutex<Connection>,
+    hashed_address: Option<B256>,
+    max_block_number: u64,
+    last_seeked: Option<Nibbles>,
+}
+
+impl SqlitePreimageStoreCursor {
+    pub fn new(conn: Connection, hashed_address: Option<B256>, max_block_number: u64) -> Self {
+        Self { conn: Mutex::new(conn), hashed_address, max_block_number, last_seeked: None }
+    }
+
+    fn row_to_nibbles_and_branch((path, branch): &(Vec<u8>, Vec<u8>)) -> PreimageStorageResult<(Nibbles, BranchNodeCompact)> {
+        Ok((StoredNibbles::from_compact(&path, path.len()).0.0, BranchNodeCompact::from_compact(&branch, branch.len()).0))
+    }
+
+    fn seek_first_non_empty_path_after(&mut self, path: Nibbles, inclusive: bool) -> PreimageStorageResult<Option<(Nibbles, BranchNodeCompact)>> {
+        let key = BranchNodeKey { hashed_address: self.hashed_address, path: StoredNibbles(path), block_number: self.max_block_number }.encode();
+        let max_key = BranchNodeKey { hashed_address: self.hashed_address, path: StoredNibbles(path), block_number: u64::MAX }.encode();
+
+        // only look at keys at this path (max key ensures that)
+        let row: Option<(Vec<u8>, Vec<u8>)> = self.conn.lock().unwrap().query_row(
+            "SELECT path, branch FROM branch_nodes WHERE (key > ? OR (key = ? AND ?)) AND key <= ? ORDER BY key DESC LIMIT 1",
+            params![key, key, inclusive, max_key],
+            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)),
+        ).optional()?;
+
+        // if branch is empty, that means the latest operation was a deletion, so move on to the next path
+        if row.as_ref().map(|(_, branch)| branch.is_empty()).unwrap_or(false) {
+            return self.seek_first_non_empty_path_after(path, inclusive);
+        }
+
+        if let Some(row) = row {
+            Ok(Some(Self::row_to_nibbles_and_branch(&row)?))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl PreimageStoreCursor for SqlitePreimageStoreCursor {
+    fn seek_exact(&mut self, path: Nibbles) -> PreimageStorageResult<Option<(Nibbles, BranchNodeCompact)>> {
+        let Some((returned_path, branch)) = self.seek_first_non_empty_path_after(path, true)? else {
+            return Ok(None);
+        };
+
+        if returned_path != path {
+            return Ok(None);
+        }
+        self.last_seeked = Some(path);
+        Ok(Some((path, branch)))
+    }
+
+    fn seek(&mut self, path: Nibbles) -> PreimageStorageResult<Option<(Nibbles, BranchNodeCompact)>> {
+        let Some((returned_path, branch)) = self.seek_first_non_empty_path_after(path, true)? else {
+            return Ok(None);
+        };
+        self.last_seeked = Some(returned_path);
+        Ok(Some((returned_path, branch)))
+    }
+
+    fn next(&mut self) -> PreimageStorageResult<Option<(Nibbles, BranchNodeCompact)>> {
+        let Some(last_seeked) = self.last_seeked else {
+            return self.seek_first_non_empty_path_after(Nibbles::default(), true);
+        };
+        let Some((returned_path, branch)) = self.seek_first_non_empty_path_after(last_seeked, false)? else {
+            return Ok(None);
+        };
+        self.last_seeked = Some(returned_path);
+        Ok(Some((returned_path, branch)))
+    }
+
+    fn current(&mut self) -> PreimageStorageResult<Option<Nibbles>> {
+        Ok(self.last_seeked)
+    }
+}
 
 /// SQLite implementation of PreimageStore
 #[derive(Debug, Clone)]
@@ -141,6 +218,8 @@ impl BranchNodeKey {
 
 #[async_trait::async_trait]
 impl PreimageStore for SqlitePreimageStore {
+    type Cursor = SqlitePreimageStoreCursor;
+
     async fn store_preimage(
         &self,
         block_number: u64,
@@ -246,6 +325,10 @@ impl PreimageStore for SqlitePreimageStore {
             .map_err(|e| PreimageStorageError::ConnectionError(format!("sqlite healthcheck failed: {}", e)))?;
         info!("SQLite store is healthy");
         Ok(())
+    }
+
+    fn cursor(&self, hashed_address: Option<B256>, max_block_number: u64) -> PreimageStorageResult<Self::Cursor> {
+        Ok(SqlitePreimageStoreCursor::new(self.connect()?, hashed_address, max_block_number))
     }
 }
 

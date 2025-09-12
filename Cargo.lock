@@ -6183,8 +6183,10 @@ dependencies = [
 name = "proof-helper"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
  "alloy-rlp",
  "async-trait",
+ "auto_impl",
  "aws-config",
  "aws-sdk-dynamodb",
  "aws-smithy-runtime-api",
@@ -6201,6 +6203,7 @@ dependencies = [
  "reth-codecs",
  "reth-db-api",
  "reth-evm",
+ "reth-execution-errors",
  "reth-execution-types",
  "reth-exex",
  "reth-node-ethereum",

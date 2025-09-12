@@ -14,30 +14,33 @@ mod config;
 mod sqlite;
 mod storage;
 mod rpc;
+mod provider;
+mod proof;
 
 use config::{ProofHelperConfig, StorageBackend};
 use sqlite::SqlitePreimageStore;
 use storage::{PreimageBatch, PreimageEntry, PreimageStore};
 
-use crate::rpc::{EthApiExt, EthApiOverrideServer};
+use crate::{rpc::{EthApiExt, EthApiOverrideServer}, sqlite::SqlitePreimageStoreCursor};
 
 /// Proof Helper ExEx - processes blocks and tracks state changes
-pub struct ProofHelper<Node>
+pub struct ProofHelper<Node, PreimageStore>
 where
     Node: FullNodeComponents,
     Node::Provider: StateReader,
 {
     ctx: ExExContext<Node>,
-    storage: Arc<dyn PreimageStore>,
+    storage: PreimageStore,
 }
 
-impl<Node, Primitives> ProofHelper<Node>
+impl<Node, Primitives, P> ProofHelper<Node, P>
 where
     Node: FullNodeComponents<Types: NodeTypes<Primitives = Primitives>>,
     Primitives: NodePrimitives,
+    P: PreimageStore,
 {
     /// Create a new ProofHelper instance
-    pub fn new(ctx: ExExContext<Node>, storage: Arc<dyn PreimageStore>) -> Self {
+    pub fn new(ctx: ExExContext<Node>, storage: P) -> Self {
         Self { ctx, storage }
     }
 
@@ -282,7 +285,7 @@ where
 }
 
 /// Create storage backend based on configuration
-async fn create_storage(config: &ProofHelperConfig) -> eyre::Result<Arc<dyn PreimageStore>> {
+async fn create_storage(config: &ProofHelperConfig) -> eyre::Result<Arc<dyn PreimageStore<Cursor = SqlitePreimageStoreCursor>>> {
     match config.storage.backend {
         StorageBackend::SQLite => {
             info!("Using SQLite storage backend");

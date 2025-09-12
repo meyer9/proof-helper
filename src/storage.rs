@@ -1,6 +1,8 @@
 use reth::revm::primitives::B256;
-use reth_trie::{BranchNodeCompact, StoredNibbles};
+use reth_db_api::DatabaseError;
+use reth_trie::{BranchNodeCompact, Nibbles, StoredNibbles};
 use std::fmt::Debug;
+use auto_impl::auto_impl;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PreimageEntry {
@@ -36,8 +38,27 @@ pub enum PreimageStorageError {
     TableCreationError(String),
 }
 
+impl Into<DatabaseError> for PreimageStorageError {
+    fn into(self) -> DatabaseError {
+        DatabaseError::Other(self.to_string())
+    }
+}
+
+impl From<rusqlite::Error> for PreimageStorageError {
+    fn from(error: rusqlite::Error) -> Self {
+        PreimageStorageError::StorageError(error.to_string())
+    }
+}
+
 /// Result type for storage operations
 pub type PreimageStorageResult<T> = Result<T, PreimageStorageError>;
+
+pub trait PreimageStoreCursor: Send + Sync {
+    fn seek_exact(&mut self, path: Nibbles) -> PreimageStorageResult<Option<(Nibbles, BranchNodeCompact)>>;
+    fn seek(&mut self, path: Nibbles) -> PreimageStorageResult<Option<(Nibbles, BranchNodeCompact)>>;
+    fn next(&mut self) -> PreimageStorageResult<Option<(Nibbles, BranchNodeCompact)>>;
+    fn current(&mut self) -> PreimageStorageResult<Option<Nibbles>>;
+}
 
 /// Trait for storing and retrieving preimage data
 /// 
@@ -46,7 +67,10 @@ pub type PreimageStorageResult<T> = Result<T, PreimageStorageError>;
 /// 
 /// Storage model: hash (primary key) -> preimage data, with block_number as secondary index
 #[async_trait::async_trait]
+#[auto_impl(Arc)]
 pub trait PreimageStore: Send + Sync + Debug {
+    type Cursor: PreimageStoreCursor;
+
     /// Store a single preimage. Storing None will store a NULL value which will be used to 
     /// signal that the preimage was deleted at that block.
     /// 
@@ -76,6 +100,8 @@ pub trait PreimageStore: Send + Sync + Debug {
 
     /// Health check for the storage backend
     async fn health_check(&self) -> PreimageStorageResult<()>;
+
+    fn cursor(&self, hashed_address: Option<B256>, max_block_number: u64) -> PreimageStorageResult<Self::Cursor>;
 }
 
 impl PreimageBatch {
