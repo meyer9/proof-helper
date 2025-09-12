@@ -337,7 +337,7 @@ fn main() -> eyre::Result<()> {
                 Ok(proof_helper.run(config))
             })
             .extend_rpc_modules(move |ctx| {
-                let api_ext = EthApiExt::new(ctx.registry.eth_api().clone(), storage_2);
+                let api_ext = EthApiExt::new(ctx.registry.eth_api().clone(), storage_2, ctx.provider().clone());
                 ctx.modules.replace_configured(api_ext.into_rpc())?;
                 Ok(()) 
             })

@@ -6,7 +6,7 @@ use jsonrpsee::{
     proc_macros::rpc,
 };
 use jsonrpsee_core::RpcResult;
-use reth::{primitives::{Account, Bytecode}, providers::{AccountReader, BlockHashReader, BlockIdReader, BytecodeReader, HashedPostStateProvider, ProviderError, ProviderResult, StateProofProvider, StateProviderBox, StateRootProvider, StorageRootProvider}, revm::{db::BundleState, primitives::{alloy_primitives::BlockNumber, Address, Bytes, StorageValue, B256}}, rpc::{api::eth::helpers::FullEthApi, server_types::eth::EthApiError, types::{serde_helpers::JsonStorageKey, BlockId, EIP1186AccountProofResponse}}};
+use reth::{primitives::{Account, Bytecode}, providers::{AccountReader, BlockHashReader, BlockIdReader, BlockNumReader, BytecodeReader, DBProvider, DatabaseProviderFactory, HashedPostStateProvider, ProviderError, ProviderResult, StateProofProvider, StateProviderBox, StateRootProvider, StorageRootProvider}, revm::{db::BundleState, primitives::{alloy_primitives::BlockNumber, Address, Bytes, StorageValue, B256}}, rpc::{api::eth::helpers::FullEthApi, server_types::eth::EthApiError, types::{serde_helpers::JsonStorageKey, BlockId, EIP1186AccountProofResponse}}};
 use op_alloy_network::Optimism;
 
 
@@ -46,15 +46,19 @@ pub trait EthApiOverride {
 
 
 #[derive(Debug)]
-pub struct EthApiExt<Eth, P> {
+pub struct EthApiExt<Eth, P, Provider> {
     eth_api: Eth,
     preimage_store: P,
+    provider: Provider,
 }
 
-impl<Eth, P: PreimageStore + Clone + 'static> EthApiExt<Eth, P>
+impl<Eth, P, Provider> EthApiExt<Eth, P, Provider>
 where
     Eth: FullEthApi<NetworkTypes = Optimism> + Send + Sync + 'static,
     jsonrpsee_types::error::ErrorObject<'static>: From<Eth::Error>,
+    P: PreimageStore + Clone + 'static,
+    Provider: DatabaseProviderFactory + 'static,
+    Provider::Provider: Send + Sync + 'static,
  {
     async fn state_provider(&self, block_id: Option<BlockId>) -> ProviderResult<StateProviderBox> {
         let block_id = block_id.unwrap_or_default();
@@ -67,27 +71,30 @@ where
         let historical_provider = self.eth_api.state_at_block_id(block_id)
             .await
             .map_err(|e| ProviderError::other(e))?;
-        let external_overlay_provider = ExternalOverlayStateProviderRef::new(historical_provider, self.preimage_store.clone(), block_number);
+        let external_overlay_provider = ExternalOverlayStateProviderRef::new(historical_provider, self.preimage_store.clone(), self.provider.database_provider_ro()?, block_number);
 
         Ok(Box::new(external_overlay_provider))
     }
 }
 
-impl<Eth, P> EthApiExt<Eth, P> {
-    pub fn new(eth_api: Eth, preimage_store: P) -> Self {
+impl<Eth, P, Provider> EthApiExt<Eth, P, Provider> {
+    pub fn new(eth_api: Eth, preimage_store: P, provider: Provider) -> Self {
         Self {
             eth_api,
             preimage_store,
+            provider,
         }
     }
 }
 
 #[async_trait]
-impl<Eth, P> EthApiOverrideServer for EthApiExt<Eth, P>
+impl<Eth, P, Provider> EthApiOverrideServer for EthApiExt<Eth, P, Provider>
 where
     Eth: FullEthApi<NetworkTypes = Optimism> + Send + Sync + 'static,
     jsonrpsee_types::error::ErrorObject<'static>: From<Eth::Error>,
     P: PreimageStore + Clone + 'static,
+    Provider: DatabaseProviderFactory + 'static,
+    Provider::Provider: Send + Sync + 'static,
 {
 
     async fn get_proof(
