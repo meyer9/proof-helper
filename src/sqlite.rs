@@ -1,13 +1,14 @@
-use std::{path::PathBuf, sync::{Mutex, RwLock}};
+use std::{path::PathBuf, sync::{Mutex}};
 
 use reth::revm::primitives::B256;
 use reth_codecs::Compact;
 use reth_tracing::tracing::{info};
 use reth_trie::{BranchNodeCompact, Nibbles, StoredNibbles};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::storage::{PreimageBatch, PreimageStorageError, PreimageStorageResult, PreimageStore, PreimageStoreCursor};
 
+/// Cursor over an account or storage trie at a certain block number.
 pub struct SqlitePreimageStoreCursor {
     conn: Mutex<Connection>,
     hashed_address: Option<B256>,
@@ -15,89 +16,104 @@ pub struct SqlitePreimageStoreCursor {
     last_seeked: Option<Nibbles>,
 }
 
+enum NextBranchResult {
+    Found(Nibbles, BranchNodeCompact),
+    NotFound,
+    EndOfTrie,
+}
+
 impl SqlitePreimageStoreCursor {
+    /// Create a new cursor.
     pub fn new(conn: Connection, hashed_address: Option<B256>, max_block_number: u64) -> Self {
         Self { conn: Mutex::new(conn), hashed_address, max_block_number, last_seeked: None }
     }
 
+    /// Convert a branch node from a byte vector to a BranchNodeCompact.
     fn row_to_branch(branch: &Vec<u8>) -> PreimageStorageResult<BranchNodeCompact> {
         Ok(BranchNodeCompact::from_compact(&branch, branch.len()).0)
     }
 
-    fn get_latest_branch(&mut self, path: Nibbles) -> PreimageStorageResult<Option<(Nibbles, Option<BranchNodeCompact>)>> {
-        debug!("getting latest branch for {:?}", path);
+    /// Get the latest value of the branch node at the given path. Returns None 
+    fn get_latest_branch(&mut self, path: Nibbles) -> PreimageStorageResult<Option<(Nibbles, BranchNodeCompact)>> {
+        // find the key between <hashed_addr>-<path>-0 and <hashed_addr>-<path>-<max_block_number>
         let min_key = BranchNodeKey { hashed_address: self.hashed_address, path: StoredNibbles(path), block_number: 0 }.encode();
         let max_key = BranchNodeKey { hashed_address: self.hashed_address, path: StoredNibbles(path), block_number: self.max_block_number }.encode();
 
+        // sort by key descending so latest blocks come first
         let row: Option<(Vec<u8>, Vec<u8>)> = self.conn.lock().unwrap().query_row(
             "SELECT key, branch FROM branch_nodes WHERE key >= ? AND key <= ? ORDER BY key DESC LIMIT 1",
             params![min_key, max_key],
             |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)),
         ).optional()?;
 
-        // info!("row: {:?}", row);
-
+        // if there is no branch node at the given path <= max_block_number, no branch node at this path for this block
         let Some(row) = row else {
             return Ok(None);
         };
 
-        let (_, path, _) = BranchNodeKey::decode(&row.0)?;
-
+        // if the latest branch node is an empty string, the branch node was deleted, so there is no branch node at this path for this block
         if row.1.is_empty() {
-            return Ok(Some((path.0, None)));
+            return Ok(None);
         }
-
-        Ok(Some((path.0, Some(Self::row_to_branch(&row.1)?))))
+        
+        // otherwise, decode and return the branch node
+        let (_, path, _) = BranchNodeKey::decode(&row.0)?;
+        Ok(Some((path.0, Self::row_to_branch(&row.1)?)))
     }
 
-    fn get_next_latest_branch(&mut self, path: Nibbles) -> PreimageStorageResult<Option<(Nibbles, Option<BranchNodeCompact>)>> {
-        debug!("getting next latest branch for {:?}", path);
+    /// Get the branch node with the next path that possibly exists at a certain block number. Returns None if there are no more branch nodes
+    fn get_next_latest_branch(&mut self, path: Nibbles) -> PreimageStorageResult<NextBranchResult> {
         // find the next path after the current path
-        let min_key = BranchNodeKey { hashed_address: self.hashed_address, path: StoredNibbles(path), block_number: u64::MAX }.encode();
+        let last_current_path_key = BranchNodeKey { hashed_address: self.hashed_address, path: StoredNibbles(path), block_number: u64::MAX }.encode();
 
-        // next path
+        // find the next path after the current path (for any block number)
         let row: Option<Vec<u8>> = self.conn.lock().unwrap().query_row(
-            "SELECT key FROM branch_nodes WHERE key >= ? ORDER BY key ASC LIMIT 1",
-            params![min_key],
+            "SELECT key FROM branch_nodes WHERE key > ? ORDER BY key ASC LIMIT 1",
+            params![last_current_path_key],
             |r| Ok(r.get::<_, Vec<u8>>(0)?),
         ).optional()?;
 
-        // info!("row: {:?}", row);
-
+        // if there is no next path, we're at the end of the trie, return None
         let Some(row) = row else {
-            return Ok(None);
+            return Ok(NextBranchResult::EndOfTrie);
         };
         
-        let (hashed_address, path, _) = BranchNodeKey::decode(&row)?;
-        // no more paths for this account
-        if hashed_address != self.hashed_address {
-            return Ok(None);
+        // if this is the last path for this account, return None
+        let (next_trie_node_address, next_trie_node_path, _) = BranchNodeKey::decode(&row)?;
+        if next_trie_node_address != self.hashed_address {
+            return Ok(NextBranchResult::EndOfTrie);
         }
 
-        // get the latest branch for the next path
-        self.get_latest_branch(path.0)
+        // get the latest branch for this path and return it (None if there is no branch node at this path for this block)
+        match self.get_latest_branch(next_trie_node_path.0)? {
+            Some((path, branch)) => Ok(NextBranchResult::Found(path, branch)),
+            None => Ok(NextBranchResult::NotFound),
+        }
     }
 
     fn seek_first_non_empty_path_after(&mut self, path: Nibbles, inclusive: bool) -> PreimageStorageResult<Option<(Nibbles, BranchNodeCompact)>> {
-        debug!("seeking first non empty path after {:?}, {:?}, {:?}", self.hashed_address, path, self.max_block_number);
-
         // if we're seeking inclusive, first try to find the exact path
         if inclusive {
-            if let Some((path, Some(branch))) = self.get_latest_branch(path)? {
+            if let Some((path, branch)) = self.get_latest_branch(path)? {
                 return Ok(Some((path, branch)));
             }
         };
 
+        // if not inclusive, or there is no branch at the exact path, find the next path that has a branch
         let mut next_path = path;
             loop {
-                if let Some((path, branch_node)) = self.get_next_latest_branch(next_path)? {
-                    if let Some(branch_node) = branch_node {
-                        return Ok(Some((path, branch_node)));
-                    } else {
+                match self.get_next_latest_branch(next_path)? {
+                    NextBranchResult::Found(path, branch) => {
+                        return Ok(Some((path, branch)));
+                    }
+                    NextBranchResult::NotFound => {
+                        // go to the next branch node
                         next_path = path;
                     }
-                } else {
-                    return Ok(None);
+                    NextBranchResult::EndOfTrie => {
+                        // we're at the end of the trie, return None
+                        return Ok(None);
+                    }
                 }
             }
     }
