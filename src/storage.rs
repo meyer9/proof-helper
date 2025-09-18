@@ -1,13 +1,13 @@
 use reth::revm::primitives::B256;
 use reth_db_api::DatabaseError;
-use reth_trie::{BranchNodeCompact, Nibbles, StoredNibbles};
+use reth_trie::{BranchNodeCompact, Nibbles};
 use std::fmt::Debug;
 use auto_impl::auto_impl;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PreimageEntry {
     pub block_number: u64,
-    pub path: StoredNibbles,
+    pub path: Nibbles,
     pub hashed_address: Option<B256>,
     pub branch: Option<BranchNodeCompact>,
 }
@@ -81,7 +81,7 @@ pub trait PreimageStore: Send + Sync + Debug {
     async fn store_preimage(
         &self,
         block_number: u64,
-        path: StoredNibbles,
+        path: Nibbles,
         hashed_address: Option<B256>,
         branch: Option<BranchNodeCompact>,
     ) -> PreimageStorageResult<()>;

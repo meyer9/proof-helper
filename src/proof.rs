@@ -1,11 +1,9 @@
-use std::sync::Arc;
-
 use crate::{storage::{PreimageStore, PreimageStoreCursor}};
 use alloy_primitives::{keccak256, map::HashMap, Address, B256};
 use reth_db_api::{transaction::DbTx, DatabaseError};
 use reth_execution_errors::StateProofError;
 use reth_trie::{
-    hashed_cursor::HashedPostStateCursorFactory, proof::{Proof, StorageProof}, trie_cursor::{InMemoryTrieCursorFactory, TrieCursor, TrieCursorFactory}, AccountProof, BranchNodeCompact, HashedPostStateSorted, HashedStorage, MultiProof, MultiProofTargets, Nibbles, StorageMultiProof, StoredNibbles, TrieInput
+    hashed_cursor::HashedPostStateCursorFactory, proof::{Proof, StorageProof}, trie_cursor::{InMemoryTrieCursorFactory, TrieCursor, TrieCursorFactory}, AccountProof, BranchNodeCompact, HashedPostStateSorted, HashedStorage, MultiProof, MultiProofTargets, Nibbles, StorageMultiProof, TrieInput
 };
 use reth_trie_db::DatabaseHashedCursorFactory;
 

@@ -1,12 +1,9 @@
-
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use jsonrpsee::{
     proc_macros::rpc,
 };
 use jsonrpsee_core::RpcResult;
-use reth::{primitives::{Account, Bytecode}, providers::{AccountReader, BlockHashReader, BlockIdReader, BlockNumReader, BytecodeReader, DBProvider, DatabaseProviderFactory, HashedPostStateProvider, ProviderError, ProviderResult, StateProofProvider, StateProviderBox, StateRootProvider, StorageRootProvider}, revm::{db::BundleState, primitives::{alloy_primitives::BlockNumber, Address, Bytes, StorageValue, B256}}, rpc::{api::eth::helpers::FullEthApi, server_types::eth::EthApiError, types::{serde_helpers::JsonStorageKey, BlockId, EIP1186AccountProofResponse}}};
+use reth::{providers::{BlockIdReader, DatabaseProviderFactory, ProviderError, ProviderResult, StateProviderBox}, revm::{primitives::{Address}}, rpc::{api::eth::helpers::FullEthApi, server_types::eth::EthApiError, types::{serde_helpers::JsonStorageKey, BlockId, EIP1186AccountProofResponse}}};
 use op_alloy_network::Optimism;
 
 

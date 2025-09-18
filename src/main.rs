@@ -7,7 +7,7 @@ use reth::{
 use reth_db_api::{cursor::{DbCursorRO, DbDupCursorRO}, tables, transaction::DbTx};
 use reth_exex::{ExExContext, ExExEvent, ExExNotification};
 use reth_tracing::tracing::{info, warn};
-use reth_trie::{updates::{StorageTrieUpdates, TrieUpdates}, StoredNibbles};
+use reth_trie::{updates::{StorageTrieUpdates, TrieUpdates}};
 use std::sync::Arc;
 
 mod config;
@@ -61,7 +61,7 @@ where
                 // let value = entry.1;
                 batch.items.push(PreimageEntry {
                     block_number: 0,
-                    path: entry.0,
+                    path: entry.0.0,
                     hashed_address: None,
                     branch: Some(entry.1),
                 });
@@ -120,7 +120,7 @@ where
 
                     batch.items.push(PreimageEntry {
                         block_number: 0,
-                        path: StoredNibbles(branch.nibbles.0),
+                        path: branch.nibbles.0,
                         hashed_address: Some(account),
                         branch: Some(branch.node),
                     });
@@ -186,7 +186,7 @@ where
                 num_entries += 1;
                 preimage_batch.items.push(PreimageEntry {
                     block_number,
-                    path: StoredNibbles(*nibbles),
+                    path: *nibbles,
                     hashed_address: Some(*hashed_address),
                     branch: maybe_updated.map(|node| node.clone()),
                 });
@@ -225,10 +225,10 @@ where
         let mut batch_to_store = PreimageBatch::new(block.number());
 
         for (key, updated_node) in account_updates {
-            let nibbles = StoredNibbles(*key);
+            let nibbles = *key;
             match updated_node {
                 Some(node) => {
-                    if !nibbles.0.is_empty() {
+                    if !nibbles.is_empty() {
                         num_entries += 1;
                         batch_to_store.items.push(PreimageEntry {
                             block_number: block.number(),

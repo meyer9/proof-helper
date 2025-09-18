@@ -1,6 +1,4 @@
-use std::sync::Arc;
-
-use reth::{primitives::{Account, Bytecode}, providers::{AccountReader, BlockHashReader, BlockNumReader, BytecodeReader, DBProvider, HashedPostStateProvider, ProviderError, ProviderResult, StateProofProvider, StateRootProvider, StorageRootProvider}, revm::{db::BundleState, primitives::{alloy_primitives::BlockNumber, Address, Bytes, StorageValue, B256}}};
+use reth::{primitives::{Account, Bytecode}, providers::{AccountReader, BlockHashReader, BytecodeReader, DBProvider, HashedPostStateProvider, ProviderError, ProviderResult, StateProofProvider, StateRootProvider, StorageRootProvider}, revm::{db::BundleState, primitives::{alloy_primitives::BlockNumber, Address, Bytes, StorageValue, B256}}};
 use reth::providers::StateProvider;
 use reth_trie::{proof::Proof, updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage, MultiProof, MultiProofTargets, StorageMultiProof, TrieInput};
 
