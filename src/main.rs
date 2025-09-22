@@ -7,7 +7,9 @@ use reth::{
 use reth_db_api::{cursor::{DbCursorRO, DbDupCursorRO}, tables, transaction::DbTx};
 use reth_exex::{ExExContext, ExExEvent, ExExNotification};
 use reth_tracing::tracing::{info, warn};
-use reth_trie::{updates::{StorageTrieUpdates, TrieUpdates}};
+use reth_trie::{updates::{StorageTrieUpdates, TrieUpdates}, HashedPostState};
+use reth_trie::hashed_cursor::{HashedCursor, HashedCursorFactory};
+use reth_trie_db::{DatabaseHashedCursorFactory};
 use std::sync::Arc;
 
 mod config;
@@ -42,6 +44,52 @@ where
     /// Create a new ProofHelper instance
     pub fn new(ctx: ExExContext<Node>, storage: P) -> Self {
         Self { ctx, storage }
+    }
+
+    async fn backfill_leaf_nodes(&self) -> eyre::Result<()> {
+        let db_provider = self.ctx.provider().database_provider_ro()?;
+        let db_hashed_post_state_provider = DatabaseHashedCursorFactory::new(db_provider.tx_ref());
+        let mut hashed_cursor = db_hashed_post_state_provider.hashed_account_cursor()?;
+        let mut account_entries = Vec::new();
+        
+        loop {
+            let entry = hashed_cursor.next()?;
+            if let Some(entry) = entry {
+                let hashed_post_state = entry.0;
+                let mut db_storage_cursor = db_hashed_post_state_provider.hashed_storage_cursor(hashed_post_state)?;
+                account_entries.push((entry.0, Some(entry.1)));
+                let mut entries = Vec::new();
+                loop {
+                    let entry = db_storage_cursor.next()?;
+                    if let Some(entry) = entry {
+                        entries.push(entry);
+                    } else {
+                        break;
+                    }
+
+                    if entries.len() > 10000 {
+                        self.storage.store_hashed_storages(hashed_post_state, entries, 0).await?;
+                        entries = Vec::new();
+                    }
+                }
+                if entries.len() > 0 {
+                    self.storage.store_hashed_storages(hashed_post_state, entries, 0).await?;
+                }
+            } else {
+                break;
+            }
+
+            if account_entries.len() > 10000 {
+                self.storage.store_hashed_accounts(account_entries, 0).await?;
+                account_entries = Vec::new();
+            }
+        }
+
+        if account_entries.len() > 0 {
+            self.storage.store_hashed_accounts(account_entries, 0).await?;
+        }
+
+        Ok(())
     }
 
     async fn backfill_accounts_trie(&self) -> eyre::Result<()> {
@@ -256,6 +304,18 @@ where
         Ok(num_entries)
     }
 
+    async fn write_leaf_updates(&self, post_state: HashedPostState, block_number: u64) -> eyre::Result<u64> {
+        let accounts = post_state.accounts.iter().map(|(address, account)| (*address, account.clone())).collect::<Vec<_>>();
+        let mut num_entries = accounts.len() as u64;
+        self.storage.store_hashed_accounts(accounts, block_number).await?;
+        for (address, storage) in post_state.storages.iter() {
+            let storages = storage.storage.iter().map(|(key, value)| (*key, *value)).collect::<Vec<_>>();
+            num_entries += storages.len() as u64;
+            self.storage.store_hashed_storages(*address, storages, block_number).await?;
+        }
+        Ok(num_entries)
+    }
+
     /// Main execution loop for the ExEx
     pub async fn run(mut self, _config: ProofHelperConfig) -> eyre::Result<()> {
         if self.storage.get_earliest_block_number().await? == None {
@@ -270,11 +330,10 @@ where
                     let latest_block = new.tip();
 
                     let parent_provider = self.ctx.provider().history_by_block_hash(latest_block.parent_hash())?;
-                    let (_, updates) = parent_provider.state_root_with_updates(hashed_post_state)?;
-
-                    info!("got {} account updates", updates.account_nodes_ref().len());
+                    let (_, updates) = parent_provider.state_root_with_updates(hashed_post_state.clone())?;
 
                     self.write_trie_updates(&updates, latest_block).await?;
+                    self.write_leaf_updates(hashed_post_state, latest_block.number()).await?;
                 }
                 _ => {}
             };

@@ -110,7 +110,7 @@ pub trait ExternalStateStore: Send + Sync + Debug {
     /// * `batch` - Batch of preimages to store
     async fn store_trie_branches(&self, batch: TrieBranchesBatch) -> ExternalStorageResult<()>;
 
-    async fn store_hashed_accounts(&self, accounts: Vec<(B256, Account)>, block_number: u64) -> ExternalStorageResult<()>;
+    async fn store_hashed_accounts(&self, accounts: Vec<(B256, Option<Account>)>, block_number: u64) -> ExternalStorageResult<()>;
 
     async fn store_hashed_storages(&self, hashed_address: B256, storages: Vec<(B256, U256)>, block_number: u64) -> ExternalStorageResult<()>;
 
