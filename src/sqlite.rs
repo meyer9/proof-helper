@@ -1,12 +1,93 @@
 use std::{path::PathBuf, sync::{Mutex}};
 
-use reth::revm::primitives::B256;
+use alloy_primitives::U256;
+use reth::{primitives::Account, revm::primitives::B256};
 use reth_codecs::Compact;
 use reth_tracing::tracing::{info};
 use reth_trie::{BranchNodeCompact, Nibbles, StoredNibbles};
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::storage::{PreimageBatch, PreimageStorageError, PreimageStorageResult, PreimageStore, PreimageStoreCursor};
+use crate::storage::{ExternalHashedCursor, ExternalStateStore, ExternalStorageError, ExternalStorageResult, ExternalTrieCursor, TrieBranchesBatch};
+
+pub struct SqlitePreimageStoreStorageCursor {
+    conn: Mutex<Connection>,
+    hashed_address: B256,
+    max_block_number: u64,
+    last_seeked: Option<B256>,
+}
+
+pub struct SqlitePreimageStoreAccountCursor {
+    conn: Mutex<Connection>,
+    max_block_number: u64,
+    last_seeked: Option<B256>,
+}
+
+impl SqlitePreimageStoreAccountCursor {
+    pub fn new(conn: Connection, max_block_number: u64) -> Self {
+        Self { conn: Mutex::new(conn), max_block_number, last_seeked: None }
+    }
+}
+
+impl SqlitePreimageStoreStorageCursor {
+    pub fn new(conn: Connection, hashed_address: B256, max_block_number: u64) -> Self {
+        Self { conn: Mutex::new(conn), hashed_address, max_block_number, last_seeked: None }
+    }
+}
+
+impl ExternalHashedCursor for SqlitePreimageStoreStorageCursor {
+    type Value = U256;
+
+    fn seek(&mut self, key: B256) -> ExternalStorageResult<Option<(B256, Self::Value)>> {
+        self.last_seeked = Some(key);
+        let result = self.conn.lock().unwrap().query_row(
+            "SELECT key, value FROM storage_nodes WHERE key >= ? AND block_number <= ? ORDER BY block_number DESC LIMIT 1",
+            params![key.to_vec(), self.max_block_number],
+            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)),
+        ).optional()
+        .map_err(Into::<ExternalStorageError>::into)?;
+        Ok(result.map(|(key, value)| (B256::from_slice(&key), U256::from_be_slice(&value))))
+    }
+
+    fn next(&mut self) -> ExternalStorageResult<Option<(B256, Self::Value)>> {
+        let result = self.conn.lock().unwrap().query_row(
+            "SELECT key, value FROM storage_nodes WHERE key > ? AND block_number <= ? ORDER BY block_number DESC LIMIT 1",
+            params![self.last_seeked.unwrap_or_default().to_vec(), self.max_block_number],
+            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)),
+        ).optional()
+        .map_err(Into::<ExternalStorageError>::into)?;
+        Ok(result.map(|(key, value)| (B256::from_slice(&key), U256::from_be_slice(&value))))
+    }
+}
+
+impl ExternalHashedCursor for SqlitePreimageStoreAccountCursor {
+    type Value = Account;
+
+    fn seek(&mut self, key: B256) -> ExternalStorageResult<Option<(B256, Self::Value)>> {
+        let result = self.conn.lock().unwrap().query_row(
+            "SELECT key, value FROM accounts WHERE key >= ? AND block_number <= ? ORDER BY block_number DESC LIMIT 1",
+            params![key.to_vec(), self.max_block_number],
+            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)),
+        ).optional()
+        .map_err(Into::<ExternalStorageError>::into)?;
+
+        let result = result.map(|(key, value)| (B256::from_slice(&key), Account::from_compact(&value, value.len()).0));
+        self.last_seeked = result.map(|(key, _)| key);
+        Ok(result)
+    }
+
+    fn next(&mut self) -> ExternalStorageResult<Option<(B256, Self::Value)>> {
+        let result = self.conn.lock().unwrap().query_row(
+            "SELECT key, value FROM accounts WHERE key > ? AND block_number <= ? ORDER BY block_number DESC LIMIT 1",
+            params![self.last_seeked.unwrap_or_default().to_vec(), self.max_block_number],
+            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)),
+        ).optional()
+        .map_err(Into::<ExternalStorageError>::into)?;
+
+        let result = result.map(|(key, value)| (B256::from_slice(&key), Account::from_compact(&value, value.len()).0));
+        self.last_seeked = result.map(|(key, _)| key);
+        Ok(result)
+    }
+}
 
 /// Cursor over an account or storage trie at a certain block number.
 pub struct SqlitePreimageStoreCursor {
@@ -29,12 +110,12 @@ impl SqlitePreimageStoreCursor {
     }
 
     /// Convert a branch node from a byte vector to a BranchNodeCompact.
-    fn row_to_branch(branch: &Vec<u8>) -> PreimageStorageResult<BranchNodeCompact> {
+    fn row_to_branch(branch: &Vec<u8>) -> ExternalStorageResult<BranchNodeCompact> {
         Ok(BranchNodeCompact::from_compact(&branch, branch.len()).0)
     }
 
     /// Get the latest value of the branch node at the given path. Returns None 
-    fn get_latest_branch(&mut self, path: Nibbles) -> PreimageStorageResult<Option<(Nibbles, BranchNodeCompact)>> {
+    fn get_latest_branch(&mut self, path: Nibbles) -> ExternalStorageResult<Option<(Nibbles, BranchNodeCompact)>> {
         // find the key between <hashed_addr>-<path>-0 and <hashed_addr>-<path>-<max_block_number>
         let key = BranchNodeKey { hashed_address: self.hashed_address, path: StoredNibbles(path) }.encode();
 
@@ -65,7 +146,7 @@ impl SqlitePreimageStoreCursor {
     }
 
     /// Get the branch node with the next path that possibly exists at a certain block number. Returns None if there are no more branch nodes
-    fn get_next_latest_branch(&mut self, path: Nibbles) -> PreimageStorageResult<NextBranchResult> {
+    fn get_next_latest_branch(&mut self, path: Nibbles) -> ExternalStorageResult<NextBranchResult> {
         // find the next path after the current path
         let last_current_path_key = BranchNodeKey { hashed_address: self.hashed_address, path: StoredNibbles(path) }.encode();
 
@@ -97,7 +178,7 @@ impl SqlitePreimageStoreCursor {
         }
     }
 
-    fn seek_first_non_empty_path_after(&mut self, path: Nibbles, inclusive: bool) -> PreimageStorageResult<Option<(Nibbles, BranchNodeCompact)>> {
+    fn seek_first_non_empty_path_after(&mut self, path: Nibbles, inclusive: bool) -> ExternalStorageResult<Option<(Nibbles, BranchNodeCompact)>> {
         // if we're seeking inclusive, first try to find the exact path
         if inclusive {
             if let Some((path, branch)) = self.get_latest_branch(path)? {
@@ -125,8 +206,8 @@ impl SqlitePreimageStoreCursor {
     }
 }
 
-impl PreimageStoreCursor for SqlitePreimageStoreCursor {
-    fn seek_exact(&mut self, path: Nibbles) -> PreimageStorageResult<Option<(Nibbles, BranchNodeCompact)>> {
+impl ExternalTrieCursor for SqlitePreimageStoreCursor {
+    fn seek_exact(&mut self, path: Nibbles) -> ExternalStorageResult<Option<(Nibbles, BranchNodeCompact)>> {
         let Some((returned_path, branch)) = self.get_latest_branch(path)? else {
             return Ok(None);
         };
@@ -135,7 +216,7 @@ impl PreimageStoreCursor for SqlitePreimageStoreCursor {
         Ok(Some((path, branch)))
     }
 
-    fn seek(&mut self, path: Nibbles) -> PreimageStorageResult<Option<(Nibbles, BranchNodeCompact)>> {
+    fn seek(&mut self, path: Nibbles) -> ExternalStorageResult<Option<(Nibbles, BranchNodeCompact)>> {
         let Some((returned_path, branch)) = self.seek_first_non_empty_path_after(path, true)? else {
             return Ok(None);
         };
@@ -143,7 +224,7 @@ impl PreimageStoreCursor for SqlitePreimageStoreCursor {
         Ok(Some((returned_path, branch)))
     }
 
-    fn next(&mut self) -> PreimageStorageResult<Option<(Nibbles, BranchNodeCompact)>> {
+    fn next(&mut self) -> ExternalStorageResult<Option<(Nibbles, BranchNodeCompact)>> {
         let Some(last_seeked) = self.last_seeked else {
             let result = self.seek_first_non_empty_path_after(Nibbles::default(), true);
             if let Ok(Some((path, _branch))) = &result {
@@ -158,7 +239,7 @@ impl PreimageStoreCursor for SqlitePreimageStoreCursor {
         Ok(Some((returned_path, branch)))
     }
 
-    fn current(&mut self) -> PreimageStorageResult<Option<Nibbles>> {
+    fn current(&mut self) -> ExternalStorageResult<Option<Nibbles>> {
         Ok(self.last_seeked)
     }
 }
@@ -172,18 +253,18 @@ pub struct SqlitePreimageStore {
 
 impl SqlitePreimageStore {
     /// Create a new SQLite store and ensure schema exists.
-    pub async fn new(db_path: impl Into<PathBuf>) -> PreimageStorageResult<Self> {
+    pub async fn new(db_path: impl Into<PathBuf>) -> ExternalStorageResult<Self> {
         let store = Self { db_path: db_path.into() };
         store.ensure_schema()?;
         Ok(store)
     }
 
-    fn connect(&self) -> PreimageStorageResult<Connection> {
+    fn connect(&self) -> ExternalStorageResult<Connection> {
         Connection::open(&self.db_path)
-            .map_err(|e| PreimageStorageError::ConnectionError(format!("Failed to open sqlite: {}", e)))
+            .map_err(|e| ExternalStorageError::ConnectionError(format!("Failed to open sqlite: {}", e)))
     }
 
-    fn ensure_schema(&self) -> PreimageStorageResult<()> {
+    fn ensure_schema(&self) -> ExternalStorageResult<()> {
         let conn = self.connect()?;
         conn.execute_batch(
             r#"
@@ -208,11 +289,11 @@ impl SqlitePreimageStore {
                 hash BLOB NOT NULL
             );
             "#,
-        ).map_err(|e| PreimageStorageError::TableCreationError(format!("Failed to create schema: {}", e)))?;
+        ).map_err(|e| ExternalStorageError::TableCreationError(format!("Failed to create schema: {}", e)))?;
 
         Ok(())
     }
-    fn encode_branch(branch: &BranchNodeCompact) -> PreimageStorageResult<Vec<u8>> {
+    fn encode_branch(branch: &BranchNodeCompact) -> ExternalStorageResult<Vec<u8>> {
         let mut out = Vec::new();
         branch
             .to_compact(&mut out);
@@ -258,9 +339,9 @@ impl BranchNodeKey {
         }
     }
 
-    fn decode(bytes: &[u8]) -> PreimageStorageResult<BranchNodeKey> {
+    fn decode(bytes: &[u8]) -> ExternalStorageResult<BranchNodeKey> {
         if bytes.len() == 0 {
-            return Err(PreimageStorageError::StorageError("key too short".to_string()));
+            return Err(ExternalStorageError::StorageError("key too short".to_string()));
         }
         
         let prefix = bytes[0];
@@ -269,7 +350,7 @@ impl BranchNodeKey {
             0x00 => {
                 // Account trie: <0x00> <addr(32)> <rlp_path>
                 if bytes.len() < 1 + 32 {
-                    return Err(PreimageStorageError::StorageError("account trie key too short".to_string()));
+                    return Err(ExternalStorageError::StorageError("account trie key too short".to_string()));
                 }
                 
                 let addr = B256::from_slice(&bytes[1..33]);
@@ -287,26 +368,28 @@ impl BranchNodeKey {
                 
                 Ok(BranchNodeKey { hashed_address: None, path })
             },
-            _ => Err(PreimageStorageError::StorageError(format!("invalid key prefix: {}", prefix)))
+            _ => Err(ExternalStorageError::StorageError(format!("invalid key prefix: {}", prefix)))
         }
     }
 }
 
 #[async_trait::async_trait]
-impl PreimageStore for SqlitePreimageStore {
-    type Cursor = SqlitePreimageStoreCursor;
+impl ExternalStateStore for SqlitePreimageStore {
+    type TrieCursor = SqlitePreimageStoreCursor;
+    type StorageCursor = SqlitePreimageStoreStorageCursor;
+    type AccountHashedCursor = SqlitePreimageStoreAccountCursor;
 
-    async fn store_preimage(
+    async fn store_trie_branch(
         &self,
         block_number: u64,
         path: Nibbles,
         hashed_address: Option<B256>,
         branch: Option<BranchNodeCompact>,
-    ) -> PreimageStorageResult<()> {
+    ) -> ExternalStorageResult<()> {
         let mut conn = self.connect()?;
         let tx = conn
             .transaction()
-            .map_err(|e| PreimageStorageError::StorageError(format!("Begin tx failed: {}", e)))?;
+            .map_err(|e| ExternalStorageError::StorageError(format!("Begin tx failed: {}", e)))?;
 
         let key = BranchNodeKey { hashed_address: hashed_address.clone(), path: StoredNibbles(path) }.encode();
         let mut path_bytes = Vec::new();
@@ -327,18 +410,18 @@ impl PreimageStore for SqlitePreimageStore {
                 block_number_int,
                 branch_bytes
             ],
-        ).map_err(|e| PreimageStorageError::StorageError(format!("insert failed: {}", e)))?;
+        ).map_err(|e| ExternalStorageError::StorageError(format!("insert failed: {}", e)))?;
 
         tx.commit()
-            .map_err(|e| PreimageStorageError::StorageError(format!("commit failed: {}", e)))?;
+            .map_err(|e| ExternalStorageError::StorageError(format!("commit failed: {}", e)))?;
         Ok(())
     }
 
-    async fn store_preimages_batch(&self, batch: PreimageBatch) -> PreimageStorageResult<()> {
+    async fn store_trie_branches(&self, batch: TrieBranchesBatch) -> ExternalStorageResult<()> {
         let mut conn = self.connect()?;
         let tx = conn
             .transaction()
-            .map_err(|e| PreimageStorageError::StorageError(format!("Begin tx failed: {}", e)))?;
+            .map_err(|e| ExternalStorageError::StorageError(format!("Begin tx failed: {}", e)))?;
 
         for item in batch.items.into_iter() {
             let key = BranchNodeKey { hashed_address: item.hashed_address.clone(), path: StoredNibbles(item.path) }.encode();
@@ -359,15 +442,56 @@ impl PreimageStore for SqlitePreimageStore {
                     block_number_int,
                     branch_bytes
                 ],
-            ).map_err(|e| PreimageStorageError::BatchError(format!("batch insert failed: {}", e)))?;
+            ).map_err(|e| ExternalStorageError::BatchError(format!("batch insert failed: {}", e)))?;
         }
 
         tx.commit()
-            .map_err(|e| PreimageStorageError::BatchError(format!("commit failed: {}", e)))?;
+            .map_err(|e| ExternalStorageError::BatchError(format!("commit failed: {}", e)))?;
         Ok(())
     }
 
-    async fn get_earliest_block_number(&self) -> PreimageStorageResult<Option<(u64, B256)>> {
+    async fn store_hashed_accounts(&self, accounts: Vec<(B256, Account)>, block_number: u64) -> ExternalStorageResult<()> {
+        let mut conn = self.connect()?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| ExternalStorageError::StorageError(format!("Begin tx failed: {}", e)))?;
+
+        let block_number_int: i64 = block_number.try_into().unwrap_or(i64::MAX);
+        for account in accounts {
+            let mut serialized_account = Vec::new();
+            account.1.to_compact(&mut serialized_account);
+
+            tx.execute(
+                "INSERT OR REPLACE INTO accounts (key, value, block_number) VALUES (?1, ?2, ?3)",
+                params![account.0.to_vec(), serialized_account, block_number_int],
+            ).map_err(|e| ExternalStorageError::StorageError(format!("insert failed: {}", e)))?;
+        }
+
+        tx.commit()
+            .map_err(|e| ExternalStorageError::StorageError(format!("commit failed: {}", e)))?;
+        Ok(())
+    }
+
+    async fn store_hashed_storages(&self, hashed_address: B256, storages: Vec<(B256, U256)>, block_number: u64) -> ExternalStorageResult<()> {
+        let mut conn = self.connect()?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| ExternalStorageError::StorageError(format!("Begin tx failed: {}", e)))?;
+
+        let block_number_int: i64 = block_number.try_into().unwrap_or(i64::MAX);
+        for storage in storages {
+            tx.execute(
+                "INSERT OR REPLACE INTO storage_nodes (key, value, block_number) VALUES (?1, ?2, ?3)",
+                params![storage.0.to_vec(), storage.1.to_be_bytes_vec(), block_number_int],
+            ).map_err(|e| ExternalStorageError::StorageError(format!("insert failed: {}", e)))?;
+        }
+
+        tx.commit()
+            .map_err(|e| ExternalStorageError::StorageError(format!("commit failed: {}", e)))?;
+        Ok(())
+    }
+
+    async fn get_earliest_block_number(&self) -> ExternalStorageResult<Option<(u64, B256)>> {
         let conn = self.connect()?;
         let row: Option<(i64, Vec<u8>)> = conn
             .query_row(
@@ -376,7 +500,7 @@ impl PreimageStore for SqlitePreimageStore {
                 |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)),
             )
             .optional()
-            .map_err(|e| PreimageStorageError::StorageError(format!("query failed: {}", e)))?;
+            .map_err(|e| ExternalStorageError::StorageError(format!("query failed: {}", e)))?;
 
         if let Some((bn, hash_bytes)) = row {
             let mut h = [0u8; 32];
@@ -388,26 +512,34 @@ impl PreimageStore for SqlitePreimageStore {
         }
     }
 
-    async fn set_earliest_block_number(&self, block_number: u64, hash: B256) -> PreimageStorageResult<()> {
+    async fn set_earliest_block_number(&self, block_number: u64, hash: B256) -> ExternalStorageResult<()> {
         let conn = self.connect()?;
         conn.execute(
             "INSERT INTO earliest_block (id, block_number, hash) VALUES (1, ?1, ?2) ON CONFLICT(id) DO UPDATE SET block_number=excluded.block_number, hash=excluded.hash",
             params![block_number as i64, hash.as_slice()],
-        ).map_err(|e| PreimageStorageError::StorageError(format!("upsert earliest_block failed: {}", e)))?;
+        ).map_err(|e| ExternalStorageError::StorageError(format!("upsert earliest_block failed: {}", e)))?;
         Ok(())
     }
 
-    async fn health_check(&self) -> PreimageStorageResult<()> {
+    async fn health_check(&self) -> ExternalStorageResult<()> {
         let conn = self.connect()?;
         let _: i64 = conn
             .query_row("SELECT 1", [], |r| r.get(0))
-            .map_err(|e| PreimageStorageError::ConnectionError(format!("sqlite healthcheck failed: {}", e)))?;
+            .map_err(|e| ExternalStorageError::ConnectionError(format!("sqlite healthcheck failed: {}", e)))?;
         info!("SQLite store is healthy");
         Ok(())
     }
 
-    fn cursor(&self, hashed_address: Option<B256>, max_block_number: u64) -> PreimageStorageResult<Self::Cursor> {
+    fn trie_cursor(&self, hashed_address: Option<B256>, max_block_number: u64) -> ExternalStorageResult<Self::TrieCursor> {
         Ok(SqlitePreimageStoreCursor::new(self.connect()?, hashed_address, max_block_number))
+    }
+
+    fn storage_hashed_cursor(&self, hashed_address: B256, max_block_number: u64) -> ExternalStorageResult<Self::StorageCursor> {
+        Ok(SqlitePreimageStoreStorageCursor::new(self.connect()?, hashed_address, max_block_number))
+    }
+
+    fn account_hashed_cursor(&self, max_block_number: u64) -> ExternalStorageResult<Self::AccountHashedCursor> {
+        Ok(SqlitePreimageStoreAccountCursor::new(self.connect()?, max_block_number))
     }
 }
 
@@ -468,7 +600,7 @@ mod tests {
     #[tokio::test]
     async fn test_cursor_empty_trie() {
         let store = setup_test_store().await;
-        let mut cursor = store.cursor(None, 100).unwrap();
+        let mut cursor = store.trie_cursor(None, 100).unwrap();
 
         // All operations should return None on empty trie
         assert!(cursor.seek_exact(Nibbles::default()).unwrap().is_none());
@@ -484,9 +616,9 @@ mod tests {
         let branch = create_test_branch();
         
         // Store single entry
-        store.store_preimage(50, path.clone(), None, Some(branch.clone())).await.unwrap();
+        store.store_trie_branch(50, path.clone(), None, Some(branch.clone())).await.unwrap();
         
-        let mut cursor = store.cursor(None, 100).unwrap();
+        let mut cursor = store.trie_cursor(None, 100).unwrap();
 
         // Test seek_exact
         let result = cursor.seek_exact(path).unwrap().unwrap();
@@ -512,10 +644,10 @@ mod tests {
         
         // Store multiple entries
         for path in &paths {
-            store.store_preimage(50, path.clone(), None, Some(branch.clone())).await.unwrap();
+            store.store_trie_branch(50, path.clone(), None, Some(branch.clone())).await.unwrap();
         }
         
-        let mut cursor = store.cursor(None, 100).unwrap();
+        let mut cursor = store.trie_cursor(None, 100).unwrap();
 
         // Test that we can iterate through all entries
         let mut found_paths = Vec::new();
@@ -538,9 +670,9 @@ mod tests {
         let path = nibbles_from(vec![1, 2, 3]);
         let branch = create_test_branch();
         
-        store.store_preimage(50, path.clone(), None, Some(branch.clone())).await.unwrap();
+        store.store_trie_branch(50, path.clone(), None, Some(branch.clone())).await.unwrap();
         
-        let mut cursor = store.cursor(None, 100).unwrap();
+        let mut cursor = store.trie_cursor(None, 100).unwrap();
         let result = cursor.seek_exact(path).unwrap().unwrap();
         assert_eq!(result.0, path);
     }
@@ -551,9 +683,9 @@ mod tests {
         let path = nibbles_from(vec![1, 2, 3]);
         let branch = create_test_branch();
         
-        store.store_preimage(50, path.clone(), None, Some(branch.clone())).await.unwrap();
+        store.store_trie_branch(50, path.clone(), None, Some(branch.clone())).await.unwrap();
         
-        let mut cursor = store.cursor(None, 100).unwrap();
+        let mut cursor = store.trie_cursor(None, 100).unwrap();
         let non_existing = nibbles_from(vec![4, 5, 6]);
         assert!(cursor.seek_exact(non_existing).unwrap().is_none());
     }
@@ -564,9 +696,9 @@ mod tests {
         let path = nibbles_from(vec![]);
         let branch = create_test_branch();
         
-        store.store_preimage(50, path.clone(), None, Some(branch.clone())).await.unwrap();
+        store.store_trie_branch(50, path.clone(), None, Some(branch.clone())).await.unwrap();
         
-        let mut cursor = store.cursor(None, 100).unwrap();
+        let mut cursor = store.trie_cursor(None, 100).unwrap();
         let result = cursor.seek_exact(Nibbles::default()).unwrap().unwrap();
         assert_eq!(result.0, Nibbles::default());
     }
@@ -577,9 +709,9 @@ mod tests {
         let path = nibbles_from(vec![1, 2, 3]);
         let branch = create_test_branch();
         
-        store.store_preimage(50, path.clone(), None, Some(branch.clone())).await.unwrap();
+        store.store_trie_branch(50, path.clone(), None, Some(branch.clone())).await.unwrap();
         
-        let mut cursor = store.cursor(None, 100).unwrap();
+        let mut cursor = store.trie_cursor(None, 100).unwrap();
         let result = cursor.seek(path).unwrap().unwrap();
         assert_eq!(result.0, path);
     }
@@ -591,10 +723,10 @@ mod tests {
         let path2 = nibbles_from(vec![3]);
         let branch = create_test_branch();
         
-        store.store_preimage(50, path1.clone(), None, Some(branch.clone())).await.unwrap();
-        store.store_preimage(50, path2.clone(), None, Some(branch.clone())).await.unwrap();
+        store.store_trie_branch(50, path1.clone(), None, Some(branch.clone())).await.unwrap();
+        store.store_trie_branch(50, path2.clone(), None, Some(branch.clone())).await.unwrap();
         
-        let mut cursor = store.cursor(None, 100).unwrap();
+        let mut cursor = store.trie_cursor(None, 100).unwrap();
         // Seek to path between 1 and 3, should return path 3
         let seek_path = nibbles_from(vec![2]);
         let result = cursor.seek(seek_path).unwrap().unwrap();
@@ -607,9 +739,9 @@ mod tests {
         let path = nibbles_from(vec![1]);
         let branch = create_test_branch();
         
-        store.store_preimage(50, path.clone(), None, Some(branch.clone())).await.unwrap();
+        store.store_trie_branch(50, path.clone(), None, Some(branch.clone())).await.unwrap();
         
-        let mut cursor = store.cursor(None, 100).unwrap();
+        let mut cursor = store.trie_cursor(None, 100).unwrap();
         // Seek to path after all nodes
         let seek_path = nibbles_from(vec![9]);
         assert!(cursor.seek(seek_path).unwrap().is_none());
@@ -621,9 +753,9 @@ mod tests {
         let path = nibbles_from(vec![5]);
         let branch = create_test_branch();
         
-        store.store_preimage(50, path.clone(), None, Some(branch.clone())).await.unwrap();
+        store.store_trie_branch(50, path.clone(), None, Some(branch.clone())).await.unwrap();
         
-        let mut cursor = store.cursor(None, 100).unwrap();
+        let mut cursor = store.trie_cursor(None, 100).unwrap();
         // Seek to path before all nodes, should return first node
         let seek_path = nibbles_from(vec![1]);
         let result = cursor.seek(seek_path).unwrap().unwrap();
@@ -638,9 +770,9 @@ mod tests {
         let path = nibbles_from(vec![1, 2]);
         let branch = create_test_branch();
         
-        store.store_preimage(50, path.clone(), None, Some(branch.clone())).await.unwrap();
+        store.store_trie_branch(50, path.clone(), None, Some(branch.clone())).await.unwrap();
         
-        let mut cursor = store.cursor(None, 100).unwrap();
+        let mut cursor = store.trie_cursor(None, 100).unwrap();
         // next() without prior seek should start from beginning
         let result = cursor.next().unwrap().unwrap();
         assert_eq!(result.0, path);
@@ -653,10 +785,10 @@ mod tests {
         let path2 = nibbles_from(vec![2]);
         let branch = create_test_branch();
         
-        store.store_preimage(50, path1.clone(), None, Some(branch.clone())).await.unwrap();
-        store.store_preimage(50, path2.clone(), None, Some(branch.clone())).await.unwrap();
+        store.store_trie_branch(50, path1.clone(), None, Some(branch.clone())).await.unwrap();
+        store.store_trie_branch(50, path2.clone(), None, Some(branch.clone())).await.unwrap();
         
-        let mut cursor = store.cursor(None, 100).unwrap();
+        let mut cursor = store.trie_cursor(None, 100).unwrap();
         cursor.seek(path1).unwrap();
         
         // next() should return second node
@@ -670,9 +802,9 @@ mod tests {
         let path = nibbles_from(vec![1]);
         let branch = create_test_branch();
         
-        store.store_preimage(50, path.clone(), None, Some(branch.clone())).await.unwrap();
+        store.store_trie_branch(50, path.clone(), None, Some(branch.clone())).await.unwrap();
         
-        let mut cursor = store.cursor(None, 100).unwrap();
+        let mut cursor = store.trie_cursor(None, 100).unwrap();
         cursor.seek(path).unwrap();
         
         // next() at end should return None
@@ -690,10 +822,10 @@ mod tests {
         let branch = create_test_branch();
         
         for path in &paths {
-            store.store_preimage(50, path.clone(), None, Some(branch.clone())).await.unwrap();
+            store.store_trie_branch(50, path.clone(), None, Some(branch.clone())).await.unwrap();
         }
         
-        let mut cursor = store.cursor(None, 100).unwrap();
+        let mut cursor = store.trie_cursor(None, 100).unwrap();
         
         // Iterate through all with consecutive next() calls
         for expected_path in &paths {
@@ -712,10 +844,10 @@ mod tests {
         let path2 = nibbles_from(vec![2]);
         let branch = create_test_branch();
         
-        store.store_preimage(50, path1.clone(), None, Some(branch.clone())).await.unwrap();
-        store.store_preimage(50, path2.clone(), None, Some(branch.clone())).await.unwrap();
+        store.store_trie_branch(50, path1.clone(), None, Some(branch.clone())).await.unwrap();
+        store.store_trie_branch(50, path2.clone(), None, Some(branch.clone())).await.unwrap();
         
-        let mut cursor = store.cursor(None, 100).unwrap();
+        let mut cursor = store.trie_cursor(None, 100).unwrap();
         
         // Current should be None initially
         assert!(cursor.current().unwrap().is_none());
@@ -732,7 +864,7 @@ mod tests {
     #[tokio::test]
     async fn test_current_no_prior_operations() {
         let store = setup_test_store().await;
-        let mut cursor = store.cursor(None, 100).unwrap();
+        let mut cursor = store.trie_cursor(None, 100).unwrap();
         
         // Current should be None when no operations performed
         assert!(cursor.current().unwrap().is_none());
@@ -759,17 +891,17 @@ mod tests {
         };
         
         // Store same path at different blocks
-        store.store_preimage(50, path.clone(), None, Some(branch1.clone())).await.unwrap();
-        store.store_preimage(100, path.clone(), None, Some(branch2.clone())).await.unwrap();
+        store.store_trie_branch(50, path.clone(), None, Some(branch1.clone())).await.unwrap();
+        store.store_trie_branch(100, path.clone(), None, Some(branch2.clone())).await.unwrap();
         
         // Cursor with max_block_number=75 should see only block 50 data
-        let mut cursor75 = store.cursor(None, 75).unwrap();
+        let mut cursor75 = store.trie_cursor(None, 75).unwrap();
         let result75 = cursor75.seek_exact(path).unwrap().unwrap();
         assert_eq!(result75.0, path);
         // We can't easily verify the branch content without more complex comparison
         
         // Cursor with max_block_number=150 should see block 100 data (latest)
-        let mut cursor150 = store.cursor(None, 150).unwrap();
+        let mut cursor150 = store.trie_cursor(None, 150).unwrap();
         let result150 = cursor150.seek_exact(path).unwrap().unwrap();
         assert_eq!(result150.0, path);
     }
@@ -781,16 +913,16 @@ mod tests {
         let branch = create_test_branch();
         
         // Store branch node, then delete it (store None)
-        store.store_preimage(50, path.clone(), None, Some(branch.clone())).await.unwrap();
-        store.store_preimage(100, path.clone(), None, None).await.unwrap();
+        store.store_trie_branch(50, path.clone(), None, Some(branch.clone())).await.unwrap();
+        store.store_trie_branch(100, path.clone(), None, None).await.unwrap();
 
         
         // Cursor before deletion should see the node
-        let mut cursor75 = store.cursor(None, 75).unwrap();
+        let mut cursor75 = store.trie_cursor(None, 75).unwrap();
         assert!(cursor75.seek_exact(path).unwrap().is_some());
         
         // Cursor after deletion should not see the node
-        let mut cursor150 = store.cursor(None, 150).unwrap();
+        let mut cursor150 = store.trie_cursor(None, 150).unwrap();
         assert!(cursor150.seek_exact(path).unwrap().is_none());
     }
 
@@ -805,21 +937,21 @@ mod tests {
         let branch = create_test_branch();
         
         // Store same path for different accounts
-        store.store_preimage(50, path.clone(), Some(addr1), Some(branch.clone())).await.unwrap();
-        store.store_preimage(50, path.clone(), Some(addr2), Some(branch.clone())).await.unwrap();
+        store.store_trie_branch(50, path.clone(), Some(addr1), Some(branch.clone())).await.unwrap();
+        store.store_trie_branch(50, path.clone(), Some(addr2), Some(branch.clone())).await.unwrap();
         
         // Cursor for addr1 should only see addr1 data
-        let mut cursor1 = store.cursor(Some(addr1), 100).unwrap();
+        let mut cursor1 = store.trie_cursor(Some(addr1), 100).unwrap();
         let result1 = cursor1.seek_exact(path).unwrap().unwrap();
         assert_eq!(result1.0, path);
         
         // Cursor for addr2 should only see addr2 data
-        let mut cursor2 = store.cursor(Some(addr2), 100).unwrap();
+        let mut cursor2 = store.trie_cursor(Some(addr2), 100).unwrap();
         let result2 = cursor2.seek_exact(path).unwrap().unwrap();
         assert_eq!(result2.0, path);
         
         // Cursor for addr1 should not see addr2 data when iterating
-        let mut cursor1_iter = store.cursor(Some(addr1), 100).unwrap();
+        let mut cursor1_iter = store.trie_cursor(Some(addr1), 100).unwrap();
         let mut found_count = 0;
         while cursor1_iter.next().unwrap().is_some() {
             found_count += 1;
@@ -835,16 +967,16 @@ mod tests {
         let branch = create_test_branch();
         
         // Store data for account trie and state trie
-        store.store_preimage(50, path.clone(), Some(addr), Some(branch.clone())).await.unwrap();
-        store.store_preimage(50, path.clone(), None, Some(branch.clone())).await.unwrap();
+        store.store_trie_branch(50, path.clone(), Some(addr), Some(branch.clone())).await.unwrap();
+        store.store_trie_branch(50, path.clone(), None, Some(branch.clone())).await.unwrap();
         
         // State trie cursor (None address) should only see state trie data
-        let mut state_cursor = store.cursor(None, 100).unwrap();
+        let mut state_cursor = store.trie_cursor(None, 100).unwrap();
         let result = state_cursor.seek_exact(path).unwrap().unwrap();
         assert_eq!(result.0, path);
         
         // Verify state cursor doesn't see account data when iterating
-        let mut state_cursor_iter = store.cursor(None, 100).unwrap();
+        let mut state_cursor_iter = store.trie_cursor(None, 100).unwrap();
         let mut found_count = 0;
         let mut found_paths = Vec::new();
         while let Some((path, _)) = state_cursor_iter.next().unwrap() {
@@ -866,11 +998,11 @@ mod tests {
         let branch = create_test_branch();
         
         // Store mixed account and state trie data
-        store.store_preimage(50, path1.clone(), Some(addr), Some(branch.clone())).await.unwrap();
-        store.store_preimage(50, path2.clone(), None, Some(branch.clone())).await.unwrap();
+        store.store_trie_branch(50, path1.clone(), Some(addr), Some(branch.clone())).await.unwrap();
+        store.store_trie_branch(50, path2.clone(), None, Some(branch.clone())).await.unwrap();
         
         // Account cursor should only see account data
-        let mut account_cursor = store.cursor(Some(addr), 100).unwrap();
+        let mut account_cursor = store.trie_cursor(Some(addr), 100).unwrap();
         let mut account_paths = Vec::new();
         while let Some((path, _)) = account_cursor.next().unwrap() {
             account_paths.push(path);
@@ -879,7 +1011,7 @@ mod tests {
         assert_eq!(account_paths[0], path1);
         
         // State cursor should only see state data
-        let mut state_cursor = store.cursor(None, 100).unwrap();
+        let mut state_cursor = store.trie_cursor(None, 100).unwrap();
         let mut state_paths = Vec::new();
         while let Some((path, _)) = state_cursor.next().unwrap() {
             state_paths.push(path);
@@ -903,10 +1035,10 @@ mod tests {
         
         // Store paths in random order
         for path in &paths {
-            store.store_preimage(50, path.clone(), None, Some(branch.clone())).await.unwrap();
+            store.store_trie_branch(50, path.clone(), None, Some(branch.clone())).await.unwrap();
         }
         
-        let mut cursor = store.cursor(None, 100).unwrap();
+        let mut cursor = store.trie_cursor(None, 100).unwrap();
         let mut found_paths = Vec::new();
         while let Some((path, _)) = cursor.next().unwrap() {
             found_paths.push(path);
@@ -934,10 +1066,10 @@ mod tests {
         let branch = create_test_branch();
         
         for path in &paths {
-            store.store_preimage(50, path.clone(), None, Some(branch.clone())).await.unwrap();
+            store.store_trie_branch(50, path.clone(), None, Some(branch.clone())).await.unwrap();
         }
         
-        let mut cursor = store.cursor(None, 100).unwrap();
+        let mut cursor = store.trie_cursor(None, 100).unwrap();
         
         // Seek to prefix should find exact match
         let result = cursor.seek_exact(paths[0]).unwrap().unwrap();
@@ -965,11 +1097,11 @@ mod tests {
         let branch = create_test_branch();
         
         for path in &paths {
-            store.store_preimage(50, path.clone(), None, Some(branch.clone())).await.unwrap();
+            store.store_trie_branch(50, path.clone(), None, Some(branch.clone())).await.unwrap();
         }
         
 
-        let mut cursor = store.cursor(None, 100).unwrap();
+        let mut cursor = store.trie_cursor(None, 100).unwrap();
         let mut found_paths = Vec::new();
         while let Some((path, _)) = cursor.next().unwrap() {
             found_paths.push(path);

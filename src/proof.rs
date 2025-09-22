@@ -1,4 +1,4 @@
-use crate::{storage::{PreimageStore, PreimageStoreCursor}};
+use crate::{storage::{ExternalStateStore, ExternalTrieCursor as ExternalDBTrieCursor}};
 use alloy_primitives::{keccak256, map::HashMap, Address, B256};
 use reth_db_api::{transaction::DbTx, DatabaseError};
 use reth_execution_errors::StateProofError;
@@ -15,7 +15,7 @@ impl<C> ExternalTrieCursor<C> {
     }
 }
 
-impl<C: PreimageStoreCursor + Send + Sync> TrieCursor for ExternalTrieCursor<C> {
+impl<C: ExternalDBTrieCursor + Send + Sync> TrieCursor for ExternalTrieCursor<C> {
     fn seek_exact(&mut self, key: Nibbles) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError> {
         self.0.seek_exact(key)
             .map_err(Into::into)
@@ -50,16 +50,16 @@ impl<P> ExternalTrieCursorFactory<P> {
     }
 }
 
-impl<P: PreimageStore> TrieCursorFactory for ExternalTrieCursorFactory<P> {
-    type AccountTrieCursor = ExternalTrieCursor<P::Cursor>;
-    type StorageTrieCursor = ExternalTrieCursor<P::Cursor>;
+impl<P: ExternalStateStore> TrieCursorFactory for ExternalTrieCursorFactory<P> {
+    type AccountTrieCursor = ExternalTrieCursor<P::TrieCursor>;
+    type StorageTrieCursor = ExternalTrieCursor<P::TrieCursor>;
 
     fn account_trie_cursor(&self) -> Result<Self::AccountTrieCursor, DatabaseError> {
-        Ok(ExternalTrieCursor::new(self.preimage_store.cursor(None, self.block_number).map_err(Into::<DatabaseError>::into)?))
+        Ok(ExternalTrieCursor::new(self.preimage_store.trie_cursor(None, self.block_number).map_err(Into::<DatabaseError>::into)?))
     }
     
     fn storage_trie_cursor(&self, hashed_address: B256) -> Result<Self::StorageTrieCursor, DatabaseError> {
-        Ok(ExternalTrieCursor::new(self.preimage_store.cursor(Some(hashed_address), self.block_number).map_err(Into::<DatabaseError>::into)?))
+        Ok(ExternalTrieCursor::new(self.preimage_store.trie_cursor(Some(hashed_address), self.block_number).map_err(Into::<DatabaseError>::into)?))
     }
 }
 
@@ -87,7 +87,7 @@ pub trait DatabaseProof<'a, TX, P> {
     ) -> Result<MultiProof, StateProofError>;
 }
 
-impl<'a, TX: DbTx, P: PreimageStore + Clone> DatabaseProof<'a, TX, P>
+impl<'a, TX: DbTx, P: ExternalStateStore + Clone> DatabaseProof<'a, TX, P>
     for Proof<ExternalTrieCursorFactory<P>, DatabaseHashedCursorFactory<'a, TX>>
 {
     /// Create a new [Proof] instance from database transaction.
@@ -167,7 +167,7 @@ pub trait DatabaseStorageProof<'a, TX, P> {
     ) -> Result<StorageMultiProof, StateProofError>;
 }
 
-impl<'a, TX: DbTx, P: PreimageStore> DatabaseStorageProof<'a, TX, P>
+impl<'a, TX: DbTx, P: ExternalStateStore> DatabaseStorageProof<'a, TX, P>
     for StorageProof<ExternalTrieCursorFactory<P>, DatabaseHashedCursorFactory<'a, TX>>
 {
     fn from_tx(tx: &'a TX, preimage_store: P, block_number: u64, address: Address) -> Self {

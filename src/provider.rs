@@ -2,11 +2,11 @@ use reth::{primitives::{Account, Bytecode}, providers::{AccountReader, BlockHash
 use reth::providers::StateProvider;
 use reth_trie::{proof::Proof, updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage, MultiProof, MultiProofTargets, StorageMultiProof, TrieInput};
 
-use crate::{proof::DatabaseProof, storage::PreimageStore};
+use crate::{proof::DatabaseProof, storage::ExternalStateStore};
 
 pub struct ExternalOverlayStateProviderRef<
     'a,
-    P: PreimageStore,
+    P: ExternalStateStore,
     Provider: DBProvider,
 > {
     /// Historical state provider for non-trie related tasks.
@@ -20,13 +20,13 @@ pub struct ExternalOverlayStateProviderRef<
     pub(crate) block_number: BlockNumber,
 }
 
-impl<P: PreimageStore, Provider: DBProvider> ExternalOverlayStateProviderRef<'_, P, Provider> {
+impl<P: ExternalStateStore, Provider: DBProvider> ExternalOverlayStateProviderRef<'_, P, Provider> {
     fn tx(&self) -> &Provider::Tx {
         self.provider.tx_ref()
     }
 }
 
-impl<'a, P: PreimageStore, Provider: DBProvider> ExternalOverlayStateProviderRef<'a, P, Provider> {
+impl<'a, P: ExternalStateStore, Provider: DBProvider> ExternalOverlayStateProviderRef<'a, P, Provider> {
     pub fn new(historical: Box<dyn StateProvider + 'a>, storage: P, provider: Provider, block_number: BlockNumber) -> Self {
         Self {
             historical,
@@ -38,7 +38,7 @@ impl<'a, P: PreimageStore, Provider: DBProvider> ExternalOverlayStateProviderRef
 }
 
 
-impl<'a, P: PreimageStore, Provider: DBProvider + Send + Sync> BlockHashReader for ExternalOverlayStateProviderRef<'a, P, Provider> {
+impl<'a, P: ExternalStateStore, Provider: DBProvider + Send + Sync> BlockHashReader for ExternalOverlayStateProviderRef<'a, P, Provider> {
     fn block_hash(&self, number: BlockNumber) -> ProviderResult<Option<B256>> {
         self.historical.block_hash(number)
     }
@@ -52,13 +52,13 @@ impl<'a, P: PreimageStore, Provider: DBProvider + Send + Sync> BlockHashReader f
     }
 }
 
-impl<'a, P: PreimageStore, Provider: DBProvider> AccountReader for ExternalOverlayStateProviderRef<'a, P, Provider> {
+impl<'a, P: ExternalStateStore, Provider: DBProvider> AccountReader for ExternalOverlayStateProviderRef<'a, P, Provider> {
     fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
         self.historical.basic_account(address)
     }
 }
 
-impl<'a, P: PreimageStore, Provider: DBProvider + Send + Sync> StateRootProvider for ExternalOverlayStateProviderRef<'a, P, Provider> {
+impl<'a, P: ExternalStateStore, Provider: DBProvider + Send + Sync> StateRootProvider for ExternalOverlayStateProviderRef<'a, P, Provider> {
     fn state_root(&self, state: HashedPostState) -> ProviderResult<B256> {
         self.state_root_from_nodes(TrieInput::from_state(state))
     }
@@ -82,7 +82,7 @@ impl<'a, P: PreimageStore, Provider: DBProvider + Send + Sync> StateRootProvider
     }
 }
 
-impl<'a, P: PreimageStore, Provider: DBProvider + Send + Sync> StorageRootProvider for ExternalOverlayStateProviderRef<'a, P, Provider> {
+impl<'a, P: ExternalStateStore, Provider: DBProvider + Send + Sync> StorageRootProvider for ExternalOverlayStateProviderRef<'a, P, Provider> {
     // TODO: Currently this does not reuse available in-memory trie nodes.
     fn storage_root(&self, address: Address, storage: HashedStorage) -> ProviderResult<B256> {
         self.historical.storage_root(address, storage)
@@ -109,7 +109,7 @@ impl<'a, P: PreimageStore, Provider: DBProvider + Send + Sync> StorageRootProvid
     }
 }
 
-impl<'a, P: PreimageStore + Clone, Provider: DBProvider + Send + Sync> StateProofProvider for ExternalOverlayStateProviderRef<'a, P, Provider> {
+impl<'a, P: ExternalStateStore + Clone, Provider: DBProvider + Send + Sync> StateProofProvider for ExternalOverlayStateProviderRef<'a, P, Provider> {
     fn proof(
         &self,
         input: TrieInput,
@@ -132,13 +132,13 @@ impl<'a, P: PreimageStore + Clone, Provider: DBProvider + Send + Sync> StateProo
     }
 }
 
-impl<'a, P: PreimageStore, Provider: DBProvider + Send + Sync> HashedPostStateProvider for ExternalOverlayStateProviderRef<'a, P, Provider> {
+impl<'a, P: ExternalStateStore, Provider: DBProvider + Send + Sync> HashedPostStateProvider for ExternalOverlayStateProviderRef<'a, P, Provider> {
     fn hashed_post_state(&self, bundle_state: &BundleState) -> HashedPostState {
         self.historical.hashed_post_state(bundle_state)
     }
 }
 
-impl<'a, P: PreimageStore + Clone, Provider: DBProvider + Send + Sync> StateProvider for ExternalOverlayStateProviderRef<'a, P, Provider> {
+impl<'a, P: ExternalStateStore + Clone, Provider: DBProvider + Send + Sync> StateProvider for ExternalOverlayStateProviderRef<'a, P, Provider> {
     fn storage(
         &self,
         address: Address,
@@ -148,7 +148,7 @@ impl<'a, P: PreimageStore + Clone, Provider: DBProvider + Send + Sync> StateProv
     }
 }
 
-impl<'a, P: PreimageStore, Provider: DBProvider + Send + Sync> BytecodeReader for ExternalOverlayStateProviderRef<'a, P, Provider> {
+impl<'a, P: ExternalStateStore, Provider: DBProvider + Send + Sync> BytecodeReader for ExternalOverlayStateProviderRef<'a, P, Provider> {
     fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>> {
         self.historical.bytecode_by_hash(code_hash)
     }

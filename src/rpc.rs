@@ -7,7 +7,7 @@ use reth::{providers::{BlockIdReader, DatabaseProviderFactory, ProviderError, Pr
 use op_alloy_network::Optimism;
 
 
-use crate::{storage::PreimageStore, provider::ExternalOverlayStateProviderRef};
+use crate::{storage::ExternalStateStore, provider::ExternalOverlayStateProviderRef};
 
 #[cfg_attr(not(test), rpc(server, namespace = "eth"))]
 #[cfg_attr(test, rpc(server, client, namespace = "eth"))]
@@ -53,7 +53,7 @@ impl<Eth, P, Provider> EthApiExt<Eth, P, Provider>
 where
     Eth: FullEthApi<NetworkTypes = Optimism> + Send + Sync + 'static,
     jsonrpsee_types::error::ErrorObject<'static>: From<Eth::Error>,
-    P: PreimageStore + Clone + 'static,
+    P: ExternalStateStore + Clone + 'static,
     Provider: DatabaseProviderFactory + 'static,
     Provider::Provider: Send + Sync + 'static,
  {
@@ -89,7 +89,7 @@ impl<Eth, P, Provider> EthApiOverrideServer for EthApiExt<Eth, P, Provider>
 where
     Eth: FullEthApi<NetworkTypes = Optimism> + Send + Sync + 'static,
     jsonrpsee_types::error::ErrorObject<'static>: From<Eth::Error>,
-    P: PreimageStore + Clone + 'static,
+    P: ExternalStateStore + Clone + 'static,
     Provider: DatabaseProviderFactory + 'static,
     Provider::Provider: Send + Sync + 'static,
 {

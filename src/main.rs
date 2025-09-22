@@ -1,7 +1,7 @@
 use futures_util::TryStreamExt;
 use op_reth::node::OpNode;
 use reth::{
-    api::{FullNodeComponents, NodePrimitives}, builder::NodeTypes, chainspec::ChainInfo, core::primitives::AlloyBlockHeader, primitives::RecoveredBlock, providers::{BlockNumReader, DBProvider, DatabaseProviderFactory, StateReader}, revm::primitives::{map::FbBuildHasher, FixedBytes, HashMap}
+    api::{FullNodeComponents, NodePrimitives}, builder::NodeTypes, chainspec::ChainInfo, core::primitives::AlloyBlockHeader, primitives::RecoveredBlock, providers::{BlockNumReader, DBProvider, DatabaseProviderFactory, HashedPostStateProvider, StateProviderFactory, StateReader}, revm::primitives::{map::FbBuildHasher, FixedBytes, HashMap}
 };
 
 use reth_db_api::{cursor::{DbCursorRO, DbDupCursorRO}, tables, transaction::DbTx};
@@ -19,9 +19,9 @@ mod proof;
 
 use config::{ProofHelperConfig, StorageBackend};
 use sqlite::SqlitePreimageStore;
-use storage::{PreimageBatch, PreimageEntry, PreimageStore};
+use storage::{TrieBranchesBatch, PreimageEntry, ExternalStateStore};
 
-use crate::{rpc::{EthApiExt, EthApiOverrideServer}, sqlite::SqlitePreimageStoreCursor};
+use crate::{rpc::{EthApiExt, EthApiOverrideServer}};
 
 /// Proof Helper ExEx - processes blocks and tracks state changes
 pub struct ProofHelper<Node, PreimageStore>
@@ -37,7 +37,7 @@ impl<Node, Primitives, P> ProofHelper<Node, P>
 where
     Node: FullNodeComponents<Types: NodeTypes<Primitives = Primitives>>,
     Primitives: NodePrimitives,
-    P: PreimageStore,
+    P: ExternalStateStore,
 {
     /// Create a new ProofHelper instance
     pub fn new(ctx: ExExContext<Node>, storage: P) -> Self {
@@ -52,7 +52,7 @@ where
         let mut accounts_trie_cursor = db.cursor_read::<tables::AccountsTrie>()?;
 
         let mut entry = accounts_trie_cursor.first()?;
-        let mut batch: PreimageBatch = PreimageBatch::new(0);
+        let mut batch: TrieBranchesBatch = TrieBranchesBatch::new(0);
 
         let mut count = 0;
         loop {
@@ -72,15 +72,15 @@ where
 
             if count % 10000 == 0 {
                 info!("AccountsTrie has {} entries", count);
-                self.storage.store_preimages_batch(batch).await?;
-                batch = PreimageBatch::new(0);
+                self.storage.store_trie_branches(batch).await?;
+                batch = TrieBranchesBatch::new(0);
             }
 
             entry = accounts_trie_cursor.next()?;
         }
 
         if batch.items.len() > 0 {
-            self.storage.store_preimages_batch(batch).await?;
+            self.storage.store_trie_branches(batch).await?;
         }
 
         info!("AccountsTrie has {} entries", count);
@@ -97,7 +97,7 @@ where
         let mut storages_trie_cursor = db.cursor_dup_read::<tables::StoragesTrie>()?;
 
         let mut storage_entry = hashed_storages_cursor.first()?;
-        let mut batch: PreimageBatch = PreimageBatch::new(0);
+        let mut batch: TrieBranchesBatch = TrieBranchesBatch::new(0);
         let mut count = 0;
         loop {
             if let Some(storage_entry) = storage_entry {
@@ -127,8 +127,8 @@ where
 
                     if (count + address_count) % 10000 == 0 {
                         info!("StoragesTrie has {} entries", count + address_count);
-                        self.storage.store_preimages_batch(batch).await?;
-                        batch = PreimageBatch::new(0);
+                        self.storage.store_trie_branches(batch).await?;
+                        batch = TrieBranchesBatch::new(0);
                     }
 
                     address_count += 1;
@@ -149,7 +149,7 @@ where
         info!("StoragesTrie has {} entries", count);
 
         if batch.items.len() > 0 {
-            self.storage.store_preimages_batch(batch).await?;
+            self.storage.store_trie_branches(batch).await?;
         }
 
         Ok(())
@@ -166,7 +166,7 @@ where
 
     async fn write_storage_trie_updates(&self, account_storage_updates: &HashMap<FixedBytes<32>, StorageTrieUpdates, FbBuildHasher<32>>, block_number: u64) -> eyre::Result<u64> {
         let mut num_entries = 0;
-        let mut preimage_batch = PreimageBatch::new(block_number);
+        let mut preimage_batch = TrieBranchesBatch::new(block_number);
         for (hashed_address, updates) in account_storage_updates {
             // The storage trie for this account has to be deleted.
             if updates.is_deleted() {
@@ -193,7 +193,7 @@ where
             }
         }
 
-        self.storage.store_preimages_batch(preimage_batch).await?;
+        self.storage.store_trie_branches(preimage_batch).await?;
 
         Ok(num_entries)
     }
@@ -222,7 +222,7 @@ where
         // Sort trie node updates.
         account_updates.sort_unstable_by(|a, b| a.0.cmp(b.0));
 
-        let mut batch_to_store = PreimageBatch::new(block.number());
+        let mut batch_to_store = TrieBranchesBatch::new(block.number());
 
         for (key, updated_node) in account_updates {
             let nibbles = *key;
@@ -250,7 +250,7 @@ where
             }
         }
 
-        self.storage.store_preimages_batch(batch_to_store).await?;
+        self.storage.store_trie_branches(batch_to_store).await?;
         num_entries += self.write_storage_trie_updates(trie_updates.storage_tries_ref(), block.number()).await?;
 
         Ok(num_entries)
@@ -265,9 +265,16 @@ where
         while let Some(notification) = self.ctx.notifications.try_next().await? {
             match &notification {
                 ExExNotification::ChainCommitted { new } => {
-                    if let Some(trie_updates) = new.trie_updates() {
-                        self.write_trie_updates(trie_updates, new.tip()).await?;
-                    }
+                    let bundle_state = new.execution_outcome().bundle.clone();
+                    let hashed_post_state = self.ctx.provider().hashed_post_state(&bundle_state);
+                    let latest_block = new.tip();
+
+                    let parent_provider = self.ctx.provider().history_by_block_hash(latest_block.parent_hash())?;
+                    let (_, updates) = parent_provider.state_root_with_updates(hashed_post_state)?;
+
+                    info!("got {} account updates", updates.account_nodes_ref().len());
+
+                    self.write_trie_updates(&updates, latest_block).await?;
                 }
                 _ => {}
             };
@@ -285,7 +292,7 @@ where
 }
 
 /// Create storage backend based on configuration
-async fn create_storage(config: &ProofHelperConfig) -> eyre::Result<Arc<dyn PreimageStore<Cursor = SqlitePreimageStoreCursor>>> {
+async fn create_storage(config: &ProofHelperConfig) -> eyre::Result<Arc<SqlitePreimageStore>> {
     match config.storage.backend {
         StorageBackend::SQLite => {
             info!("Using SQLite storage backend");
