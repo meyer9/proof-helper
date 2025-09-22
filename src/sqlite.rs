@@ -26,11 +26,149 @@ impl SqlitePreimageStoreAccountCursor {
     pub fn new(conn: Connection, max_block_number: u64) -> Self {
         Self { conn: Mutex::new(conn), max_block_number, last_seeked: None }
     }
+
+    /// Find the next valid account entry >= the given key that has data at or before max_block_number
+    fn find_next_valid_account(&self, start_key: &B256) -> ExternalStorageResult<Option<(B256, Account)>> {
+        let mut current_key = Some(*start_key);
+        
+        // Iterate through keys one by one to avoid unbounded queries
+        loop {
+            let (query, params) = if let Some(key) = current_key {
+                ("SELECT DISTINCT key FROM accounts WHERE key >= ? ORDER BY key ASC LIMIT 1",
+                 params![key.to_vec()])
+            } else {
+                // This case shouldn't happen in our logic, but handle it gracefully
+                return Ok(None);
+            };
+
+            let next_key_result = self.conn.lock().unwrap().query_row(
+                query,
+                params,
+                |r| r.get::<_, Vec<u8>>(0)
+            ).optional()
+            .map_err(Into::<ExternalStorageError>::into)?;
+
+            let Some(key_bytes) = next_key_result else {
+                // No more keys found
+                return Ok(None);
+            };
+            
+            let key = B256::from_slice(&key_bytes);
+            
+            // Get the latest version of this key within the block limit
+            if let Some(account) = self.get_latest_account_version(&key)? {
+                return Ok(Some((key, account)));
+            }
+            
+            // This key doesn't have a valid version, find the next key using >
+            current_key = self.find_next_key_after(&key)?;
+            if current_key.is_none() {
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Find the next key after the given key using > operator
+    fn find_next_key_after(&self, key: &B256) -> ExternalStorageResult<Option<B256>> {
+        let next_key_result = self.conn.lock().unwrap().query_row(
+            "SELECT DISTINCT key FROM accounts WHERE key > ? ORDER BY key ASC LIMIT 1",
+            params![key.to_vec()],
+            |r| r.get::<_, Vec<u8>>(0)
+        ).optional()
+        .map_err(Into::<ExternalStorageError>::into)?;
+
+        Ok(next_key_result.map(|bytes| B256::from_slice(&bytes)))
+    }
+
+    /// Get the latest version of a specific account key within the block limit
+    fn get_latest_account_version(&self, key: &B256) -> ExternalStorageResult<Option<Account>> {
+        let result = self.conn.lock().unwrap().query_row(
+            "SELECT value FROM accounts WHERE key = ? AND block_number <= ? ORDER BY block_number DESC LIMIT 1",
+            params![key.to_vec(), self.max_block_number],
+            |r| r.get::<_, Vec<u8>>(0)
+        ).optional()
+        .map_err(Into::<ExternalStorageError>::into)?;
+
+        if let Some(value_bytes) = result {
+            let account = Account::from_compact(&value_bytes, value_bytes.len()).0;
+            Ok(Some(account))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 impl SqlitePreimageStoreStorageCursor {
     pub fn new(conn: Connection, hashed_address: B256, max_block_number: u64) -> Self {
         Self { conn: Mutex::new(conn), hashed_address, max_block_number, last_seeked: None }
+    }
+
+    /// Find the next valid storage entry >= the given key for this account
+    fn find_next_valid_storage(&self, start_key: &B256) -> ExternalStorageResult<Option<(B256, U256)>> {
+        let mut current_key = Some(*start_key);
+        
+        // Iterate through keys one by one to avoid unbounded queries
+        loop {
+            let (query, params) = if let Some(key) = current_key {
+                ("SELECT DISTINCT storage_key FROM storage_nodes WHERE hashed_address = ? AND storage_key >= ? ORDER BY storage_key ASC LIMIT 1",
+                 params![self.hashed_address.to_vec(), key.to_vec()])
+            } else {
+                return Ok(None);
+            };
+
+            let next_key_result = self.conn.lock().unwrap().query_row(
+                query,
+                params,
+                |r| r.get::<_, Vec<u8>>(0)
+            ).optional()
+            .map_err(Into::<ExternalStorageError>::into)?;
+
+            let Some(key_bytes) = next_key_result else {
+                return Ok(None);
+            };
+            
+            let key = B256::from_slice(&key_bytes);
+            
+            // Get the latest version of this storage key within the block limit
+            if let Some(value) = self.get_latest_storage_version(&key)? {
+                return Ok(Some((key, value)));
+            }
+            
+            // This key doesn't have a valid version, find the next key using >
+            current_key = self.find_next_storage_key_after(&key)?;
+            if current_key.is_none() {
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Find the next storage key after the given key using > operator
+    fn find_next_storage_key_after(&self, key: &B256) -> ExternalStorageResult<Option<B256>> {
+        let next_key_result = self.conn.lock().unwrap().query_row(
+            "SELECT DISTINCT storage_key FROM storage_nodes WHERE hashed_address = ? AND storage_key > ? ORDER BY storage_key ASC LIMIT 1",
+            params![self.hashed_address.to_vec(), key.to_vec()],
+            |r| r.get::<_, Vec<u8>>(0)
+        ).optional()
+        .map_err(Into::<ExternalStorageError>::into)?;
+
+        Ok(next_key_result.map(|bytes| B256::from_slice(&bytes)))
+    }
+
+    /// Get the latest version of a specific storage key within the block limit
+    fn get_latest_storage_version(&self, key: &B256) -> ExternalStorageResult<Option<U256>> {
+        let result = self.conn.lock().unwrap().query_row(
+            "SELECT value FROM storage_nodes WHERE hashed_address = ? AND storage_key = ? AND block_number <= ? ORDER BY block_number DESC LIMIT 1",
+            params![self.hashed_address.to_vec(), key.to_vec(), self.max_block_number],
+            |r| r.get::<_, Vec<u8>>(0)
+        ).optional()
+        .map_err(Into::<ExternalStorageError>::into)?;
+
+        if let Some(value_bytes) = result {
+            let value = U256::from_be_slice(&value_bytes);
+            Ok(Some(value))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -38,24 +176,26 @@ impl ExternalHashedCursor for SqlitePreimageStoreStorageCursor {
     type Value = U256;
 
     fn seek(&mut self, key: B256) -> ExternalStorageResult<Option<(B256, Self::Value)>> {
-        self.last_seeked = Some(key);
-        let result = self.conn.lock().unwrap().query_row(
-            "SELECT key, value FROM storage_nodes WHERE key >= ? AND block_number <= ? ORDER BY block_number DESC LIMIT 1",
-            params![key.to_vec(), self.max_block_number],
-            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)),
-        ).optional()
-        .map_err(Into::<ExternalStorageError>::into)?;
-        Ok(result.map(|(key, value)| (B256::from_slice(&key), U256::from_be_slice(&value))))
+        let result = self.find_next_valid_storage(&key)?;
+        self.last_seeked = result.as_ref().map(|(key, _)| *key);
+        Ok(result)
     }
 
     fn next(&mut self) -> ExternalStorageResult<Option<(B256, Self::Value)>> {
-        let result = self.conn.lock().unwrap().query_row(
-            "SELECT key, value FROM storage_nodes WHERE key > ? AND block_number <= ? ORDER BY block_number DESC LIMIT 1",
-            params![self.last_seeked.unwrap_or_default().to_vec(), self.max_block_number],
-            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)),
-        ).optional()
-        .map_err(Into::<ExternalStorageError>::into)?;
-        Ok(result.map(|(key, value)| (B256::from_slice(&key), U256::from_be_slice(&value))))
+        let result = if let Some(last_seeked) = self.last_seeked {
+            // Find the next key after the last seeked key using >
+            if let Some(next_key) = self.find_next_storage_key_after(&last_seeked)? {
+                self.find_next_valid_storage(&next_key)?
+            } else {
+                None
+            }
+        } else {
+            // If this is the first call, start from the beginning
+            self.find_next_valid_storage(&B256::ZERO)?
+        };
+
+        self.last_seeked = result.as_ref().map(|(key, _)| *key);
+        Ok(result)
     }
 }
 
@@ -63,28 +203,25 @@ impl ExternalHashedCursor for SqlitePreimageStoreAccountCursor {
     type Value = Account;
 
     fn seek(&mut self, key: B256) -> ExternalStorageResult<Option<(B256, Self::Value)>> {
-        let result = self.conn.lock().unwrap().query_row(
-            "SELECT key, value FROM accounts WHERE key >= ? AND block_number <= ? ORDER BY block_number DESC LIMIT 1",
-            params![key.to_vec(), self.max_block_number],
-            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)),
-        ).optional()
-        .map_err(Into::<ExternalStorageError>::into)?;
-
-        let result = result.map(|(key, value)| (B256::from_slice(&key), Account::from_compact(&value, value.len()).0));
-        self.last_seeked = result.map(|(key, _)| key);
+        let result = self.find_next_valid_account(&key)?;
+        self.last_seeked = result.as_ref().map(|(key, _)| *key);
         Ok(result)
     }
 
     fn next(&mut self) -> ExternalStorageResult<Option<(B256, Self::Value)>> {
-        let result = self.conn.lock().unwrap().query_row(
-            "SELECT key, value FROM accounts WHERE key > ? AND block_number <= ? ORDER BY block_number DESC LIMIT 1",
-            params![self.last_seeked.unwrap_or_default().to_vec(), self.max_block_number],
-            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)),
-        ).optional()
-        .map_err(Into::<ExternalStorageError>::into)?;
+        let result = if let Some(last_seeked) = self.last_seeked {
+            // Find the next key after the last seeked key using >
+            if let Some(next_key) = self.find_next_key_after(&last_seeked)? {
+                self.find_next_valid_account(&next_key)?
+            } else {
+                None
+            }
+        } else {
+            // If this is the first call, start from the beginning
+            self.find_next_valid_account(&B256::ZERO)?
+        };
 
-        let result = result.map(|(key, value)| (B256::from_slice(&key), Account::from_compact(&value, value.len()).0));
-        self.last_seeked = result.map(|(key, _)| key);
+        self.last_seeked = result.as_ref().map(|(key, _)| *key);
         Ok(result)
     }
 }
@@ -278,10 +415,31 @@ impl SqlitePreimageStore {
                 block_number INTEGER NOT NULL,
                 branch BLOB NOT NULL,
                 PRIMARY KEY (key, block_number)
-            );
+            ) WITHOUT ROWID;
 
             CREATE INDEX IF NOT EXISTS idx_branch_nodes_block
             ON branch_nodes(block_number);
+
+            CREATE TABLE IF NOT EXISTS accounts (
+                key BLOB,
+                value BLOB NOT NULL,
+                block_number INTEGER NOT NULL,
+                PRIMARY KEY (key, block_number)
+            ) WITHOUT ROWID;
+
+            CREATE INDEX IF NOT EXISTS idx_accounts_block
+            ON accounts(block_number);
+
+            CREATE TABLE IF NOT EXISTS storage_nodes (
+                hashed_address BLOB,
+                storage_key BLOB,
+                value BLOB NOT NULL,
+                block_number INTEGER NOT NULL,
+                PRIMARY KEY (hashed_address, storage_key, block_number)
+            ) WITHOUT ROWID;
+
+            CREATE INDEX IF NOT EXISTS idx_storage_nodes_block
+            ON storage_nodes(block_number);
 
             CREATE TABLE IF NOT EXISTS earliest_block (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -481,8 +639,8 @@ impl ExternalStateStore for SqlitePreimageStore {
         let block_number_int: i64 = block_number.try_into().unwrap_or(i64::MAX);
         for storage in storages {
             tx.execute(
-                "INSERT OR REPLACE INTO storage_nodes (key, value, block_number) VALUES (?1, ?2, ?3)",
-                params![storage.0.to_vec(), storage.1.to_be_bytes_vec(), block_number_int],
+                "INSERT OR REPLACE INTO storage_nodes (hashed_address, storage_key, value, block_number) VALUES (?1, ?2, ?3, ?4)",
+                params![hashed_address.to_vec(), storage.0.to_vec(), storage.1.to_be_bytes_vec(), block_number_int],
             ).map_err(|e| ExternalStorageError::StorageError(format!("insert failed: {}", e)))?;
         }
 
@@ -1114,5 +1272,292 @@ mod tests {
         assert_eq!(found_paths[0], nibbles_from(vec![0]));
         assert_eq!(found_paths[1], nibbles_from(vec![0, 15]));
         assert_eq!(found_paths[4], nibbles_from(vec![15, 0]));
+    }
+
+    // 7. Leaf Node Tests (Hashed Accounts and Storage)
+
+    fn create_test_account() -> Account {
+        Account {
+            nonce: 42,
+            balance: U256::from(1000000),
+            bytecode_hash: Some(B256::repeat_byte(0xBB)),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_store_and_retrieve_single_account() {
+        let store = setup_test_store().await;
+        let account_key = B256::repeat_byte(0x01);
+        let account = create_test_account();
+        
+        // Store account
+        store.store_hashed_accounts(vec![(account_key, account.clone())], 50).await.unwrap();
+        
+        // Retrieve via cursor
+        let mut cursor = store.account_hashed_cursor(100).unwrap();
+        let result = cursor.seek(account_key).unwrap().unwrap();
+        
+        assert_eq!(result.0, account_key);
+        assert_eq!(result.1.nonce, account.nonce);
+        assert_eq!(result.1.balance, account.balance);
+        assert_eq!(result.1.bytecode_hash, account.bytecode_hash);
+    }
+
+    #[tokio::test]
+    async fn test_account_cursor_navigation() {
+        let store = setup_test_store().await;
+        let accounts = vec![
+            (B256::repeat_byte(0x01), create_test_account()),
+            (B256::repeat_byte(0x03), create_test_account()),
+            (B256::repeat_byte(0x05), create_test_account()),
+        ];
+        
+        // Store accounts
+        store.store_hashed_accounts(accounts.clone(), 50).await.unwrap();
+        
+        let mut cursor = store.account_hashed_cursor(100).unwrap();
+        
+        // Test seeking to exact key
+        let result = cursor.seek(accounts[1].0).unwrap().unwrap();
+        assert_eq!(result.0, accounts[1].0);
+        
+        // Test seeking to key that doesn't exist (should return next greater)
+        let seek_key = B256::repeat_byte(0x02);
+        let result = cursor.seek(seek_key).unwrap().unwrap();
+        assert_eq!(result.0, accounts[1].0); // Should find 0x03
+        
+        // Test next() navigation
+        let result = cursor.next().unwrap().unwrap();
+        assert_eq!(result.0, accounts[2].0); // Should find 0x05
+        
+        // Test next() at end
+        assert!(cursor.next().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_account_block_versioning() {
+        let store = setup_test_store().await;
+        let account_key = B256::repeat_byte(0x01);
+        let account_v1 = Account {
+            nonce: 1,
+            balance: U256::from(100),
+            bytecode_hash: Some(B256::repeat_byte(0xBB)),
+        };
+        let account_v2 = Account {
+            nonce: 2,
+            balance: U256::from(200),
+            bytecode_hash: Some(B256::repeat_byte(0xDD)),
+        };
+        
+        // Store account at different blocks
+        store.store_hashed_accounts(vec![(account_key, account_v1.clone())], 50).await.unwrap();
+        store.store_hashed_accounts(vec![(account_key, account_v2.clone())], 100).await.unwrap();
+        
+        // Cursor with max_block_number=75 should see v1
+        let mut cursor75 = store.account_hashed_cursor(75).unwrap();
+        let result75 = cursor75.seek(account_key).unwrap().unwrap();
+        assert_eq!(result75.1.nonce, account_v1.nonce);
+        assert_eq!(result75.1.balance, account_v1.balance);
+        
+        // Cursor with max_block_number=150 should see v2
+        let mut cursor150 = store.account_hashed_cursor(150).unwrap();
+        let result150 = cursor150.seek(account_key).unwrap().unwrap();
+        assert_eq!(result150.1.nonce, account_v2.nonce);
+        assert_eq!(result150.1.balance, account_v2.balance);
+    }
+
+    #[tokio::test]
+    async fn test_store_and_retrieve_storage() {
+        let store = setup_test_store().await;
+        let hashed_address = B256::repeat_byte(0x01);
+        let storage_slots = vec![
+            (B256::repeat_byte(0x10), U256::from(100)),
+            (B256::repeat_byte(0x20), U256::from(200)),
+            (B256::repeat_byte(0x30), U256::from(300)),
+        ];
+        
+        // Store storage slots
+        store.store_hashed_storages(hashed_address, storage_slots.clone(), 50).await.unwrap();
+        
+        // Retrieve via cursor
+        let mut cursor = store.storage_hashed_cursor(hashed_address, 100).unwrap();
+        
+        // Test seeking to each slot
+        for (key, expected_value) in &storage_slots {
+            let result = cursor.seek(*key).unwrap().unwrap();
+            assert_eq!(result.0, *key);
+            assert_eq!(result.1, *expected_value);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_storage_cursor_navigation() {
+        let store = setup_test_store().await;
+        let hashed_address = B256::repeat_byte(0x01);
+        let storage_slots = vec![
+            (B256::repeat_byte(0x10), U256::from(100)),
+            (B256::repeat_byte(0x30), U256::from(300)),
+            (B256::repeat_byte(0x50), U256::from(500)),
+        ];
+        
+        store.store_hashed_storages(hashed_address, storage_slots.clone(), 50).await.unwrap();
+        
+        let mut cursor = store.storage_hashed_cursor(hashed_address, 100).unwrap();
+        
+        // Start from beginning with next()
+        let mut found_slots = Vec::new();
+        while let Some((key, value)) = cursor.next().unwrap() {
+            found_slots.push((key, value));
+        }
+        
+        assert_eq!(found_slots.len(), 3);
+        assert_eq!(found_slots[0], storage_slots[0]);
+        assert_eq!(found_slots[1], storage_slots[1]);
+        assert_eq!(found_slots[2], storage_slots[2]);
+    }
+
+    #[tokio::test]
+    async fn test_storage_account_isolation() {
+        let store = setup_test_store().await;
+        let address1 = B256::repeat_byte(0x01);
+        let address2 = B256::repeat_byte(0x02);
+        let storage_key = B256::repeat_byte(0x10);
+        
+        // Store same storage key for different accounts
+        store.store_hashed_storages(address1, vec![(storage_key, U256::from(100))], 50).await.unwrap();
+        store.store_hashed_storages(address2, vec![(storage_key, U256::from(200))], 50).await.unwrap();
+        
+        // Verify each account sees only its own storage
+        let mut cursor1 = store.storage_hashed_cursor(address1, 100).unwrap();
+        let result1 = cursor1.seek(storage_key).unwrap().unwrap();
+        assert_eq!(result1.1, U256::from(100));
+        
+        let mut cursor2 = store.storage_hashed_cursor(address2, 100).unwrap();
+        let result2 = cursor2.seek(storage_key).unwrap().unwrap();
+        assert_eq!(result2.1, U256::from(200));
+        
+        // Verify cursor1 doesn't see address2's storage
+        let mut cursor1_iter = store.storage_hashed_cursor(address1, 100).unwrap();
+        let mut count = 0;
+        while cursor1_iter.next().unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 1); // Should only see one entry
+    }
+
+    #[tokio::test]
+    async fn test_storage_block_versioning() {
+        let store = setup_test_store().await;
+        let hashed_address = B256::repeat_byte(0x01);
+        let storage_key = B256::repeat_byte(0x10);
+        
+        // Store storage at different blocks
+        store.store_hashed_storages(hashed_address, vec![(storage_key, U256::from(100))], 50).await.unwrap();
+        store.store_hashed_storages(hashed_address, vec![(storage_key, U256::from(200))], 100).await.unwrap();
+        
+        // Cursor with max_block_number=75 should see old value
+        let mut cursor75 = store.storage_hashed_cursor(hashed_address, 75).unwrap();
+        let result75 = cursor75.seek(storage_key).unwrap().unwrap();
+        assert_eq!(result75.1, U256::from(100));
+        
+        // Cursor with max_block_number=150 should see new value
+        let mut cursor150 = store.storage_hashed_cursor(hashed_address, 150).unwrap();
+        let result150 = cursor150.seek(storage_key).unwrap().unwrap();
+        assert_eq!(result150.1, U256::from(200));
+    }
+
+    #[tokio::test]
+    async fn test_storage_zero_value_deletion() {
+        let store = setup_test_store().await;
+        let hashed_address = B256::repeat_byte(0x01);
+        let storage_key = B256::repeat_byte(0x10);
+        
+        // Store non-zero value
+        store.store_hashed_storages(hashed_address, vec![(storage_key, U256::from(100))], 50).await.unwrap();
+        
+        // "Delete" by storing zero value
+        store.store_hashed_storages(hashed_address, vec![(storage_key, U256::ZERO)], 100).await.unwrap();
+        
+        // Cursor before deletion should see the value
+        let mut cursor75 = store.storage_hashed_cursor(hashed_address, 75).unwrap();
+        let result75 = cursor75.seek(storage_key).unwrap().unwrap();
+        assert_eq!(result75.1, U256::from(100));
+        
+        // Cursor after deletion should see zero
+        let mut cursor150 = store.storage_hashed_cursor(hashed_address, 150).unwrap();
+        let result150 = cursor150.seek(storage_key).unwrap().unwrap();
+        assert_eq!(result150.1, U256::ZERO);
+    }
+
+    #[tokio::test]
+    async fn test_empty_cursors() {
+        let store = setup_test_store().await;
+        
+        // Test empty account cursor
+        let mut account_cursor = store.account_hashed_cursor(100).unwrap();
+        assert!(account_cursor.seek(B256::repeat_byte(0x01)).unwrap().is_none());
+        assert!(account_cursor.next().unwrap().is_none());
+        
+        // Test empty storage cursor  
+        let mut storage_cursor = store.storage_hashed_cursor(B256::repeat_byte(0x01), 100).unwrap();
+        assert!(storage_cursor.seek(B256::repeat_byte(0x10)).unwrap().is_none());
+        assert!(storage_cursor.next().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cursor_boundary_conditions() {
+        let store = setup_test_store().await;
+        let account_key = B256::repeat_byte(0x80); // Middle value
+        let account = create_test_account();
+        
+        store.store_hashed_accounts(vec![(account_key, account)], 50).await.unwrap();
+        
+        let mut cursor = store.account_hashed_cursor(100).unwrap();
+        
+        // Seek to minimum key should find our account
+        let result = cursor.seek(B256::ZERO).unwrap().unwrap();
+        assert_eq!(result.0, account_key);
+        
+        // Seek to maximum key should find nothing
+        assert!(cursor.seek(B256::repeat_byte(0xFF)).unwrap().is_none());
+        
+        // Seek to key just before our account should find our account
+        let just_before = B256::repeat_byte(0x7F);
+        let result = cursor.seek(just_before).unwrap().unwrap();
+        assert_eq!(result.0, account_key);
+    }
+
+    #[tokio::test]
+    async fn test_large_batch_operations() {
+        let store = setup_test_store().await;
+        
+        // Create large batch of accounts
+        let mut accounts = Vec::new();
+        for i in 0..100 {
+            let key = B256::from([i as u8; 32]);
+            let account = Account {
+                nonce: i as u64,
+                balance: U256::from(i * 1000),
+                bytecode_hash: Some(B256::repeat_byte((i + 1) as u8)),
+            };
+            accounts.push((key, account));
+        }
+        
+        // Store in batch
+        store.store_hashed_accounts(accounts.clone(), 50).await.unwrap();
+        
+        // Verify all accounts can be retrieved
+        let mut cursor = store.account_hashed_cursor(100).unwrap();
+        let mut found_count = 0;
+        while cursor.next().unwrap().is_some() {
+            found_count += 1;
+        }
+        assert_eq!(found_count, 100);
+        
+        // Test specific account retrieval
+        let test_key = B256::from([42u8; 32]);
+        let result = cursor.seek(test_key).unwrap().unwrap();
+        assert_eq!(result.0, test_key);
+        assert_eq!(result.1.nonce, 42);
     }
 }
