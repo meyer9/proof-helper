@@ -608,16 +608,18 @@ impl ExternalStateStore for SqlitePreimageStore {
         Ok(())
     }
 
-    async fn store_hashed_accounts(&self, accounts: Vec<(B256, Account)>, block_number: u64) -> ExternalStorageResult<()> {
+    async fn store_hashed_accounts(&self, accounts: Vec<(B256, Option<Account>)>, block_number: u64) -> ExternalStorageResult<()> {
         let mut conn = self.connect()?;
-        let tx = conn
+        let tx: rusqlite::Transaction<'_> = conn
             .transaction()
             .map_err(|e| ExternalStorageError::StorageError(format!("Begin tx failed: {}", e)))?;
 
         let block_number_int: i64 = block_number.try_into().unwrap_or(i64::MAX);
         for account in accounts {
             let mut serialized_account = Vec::new();
-            account.1.to_compact(&mut serialized_account);
+            if let Some(account) = account.1 {
+                account.to_compact(&mut serialized_account);
+            }
 
             tx.execute(
                 "INSERT OR REPLACE INTO accounts (key, value, block_number) VALUES (?1, ?2, ?3)",

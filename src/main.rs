@@ -8,8 +8,6 @@ use reth_db_api::{cursor::{DbCursorRO, DbDupCursorRO}, tables, transaction::DbTx
 use reth_exex::{ExExContext, ExExEvent, ExExNotification};
 use reth_tracing::tracing::{info, warn};
 use reth_trie::{updates::{StorageTrieUpdates, TrieUpdates}, HashedPostState};
-use reth_trie::hashed_cursor::{HashedCursor, HashedCursorFactory};
-use reth_trie_db::{DatabaseHashedCursorFactory};
 use std::sync::Arc;
 
 mod config;
@@ -48,47 +46,81 @@ where
 
     async fn backfill_leaf_nodes(&self) -> eyre::Result<()> {
         let db_provider = self.ctx.provider().database_provider_ro()?;
-        let db_hashed_post_state_provider = DatabaseHashedCursorFactory::new(db_provider.tx_ref());
-        let mut hashed_cursor = db_hashed_post_state_provider.hashed_account_cursor()?;
+        let tx = db_provider.tx_ref();
+        let mut hashed_accounts_cursor = tx.cursor_read::<tables::HashedAccounts>()?;
         let mut account_entries = Vec::new();
         
+        let mut total_accounts = 0;
+        let mut total_storage_slots = 0;
+        let mut last_account = None;
+        
         loop {
-            let entry = hashed_cursor.next()?;
-            if let Some(entry) = entry {
-                let hashed_post_state = entry.0;
-                let mut db_storage_cursor = db_hashed_post_state_provider.hashed_storage_cursor(hashed_post_state)?;
-                account_entries.push((entry.0, Some(entry.1)));
-                let mut entries = Vec::new();
-                loop {
-                    let entry = db_storage_cursor.next()?;
-                    if let Some(entry) = entry {
-                        entries.push(entry);
-                    } else {
-                        break;
-                    }
+            let entry = hashed_accounts_cursor.next()?;
 
-                    if entries.len() > 10000 {
-                        self.storage.store_hashed_storages(hashed_post_state, entries, 0).await?;
-                        entries = Vec::new();
-                    }
-                }
-                if entries.len() > 0 {
-                    self.storage.store_hashed_storages(hashed_post_state, entries, 0).await?;
-                }
-            } else {
+            let Some(entry) = entry else {
                 break;
+            };
+
+            let hashed_account = entry.0;
+            let account = entry.1;
+            account_entries.push((hashed_account, Some(account)));
+            last_account = Some(hashed_account);
+            total_accounts += 1;
+
+            if total_accounts % 10000 == 0 {
+                info!("Processed {} accounts, {} total storage slots, last account: {:?}", total_accounts, total_storage_slots, last_account);
             }
 
-            if account_entries.len() > 10000 {
+            if account_entries.len() >= 10000 {
+                info!("Storing {} account entries, total accounts: {}", account_entries.len(), total_accounts);
                 self.storage.store_hashed_accounts(account_entries, 0).await?;
                 account_entries = Vec::new();
             }
         }
 
         if account_entries.len() > 0 {
+            info!("Storing final {} account entries", account_entries.len());
             self.storage.store_hashed_accounts(account_entries, 0).await?;
         }
 
+        let mut hashed_storages_cursor = tx.cursor_dup_read::<tables::HashedStorages>()?;
+        let mut storage_entries = Vec::new();
+        let mut current_hashed_address = None;
+        loop {
+            let entry = hashed_storages_cursor.next_dup()?;
+            let Some(entry) = entry else {
+                break;
+            };
+
+            let hashed_address = entry.0;
+            let storage_entry = entry.1;
+
+            if current_hashed_address != Some(hashed_address) && storage_entries.len() > 0 && current_hashed_address.is_some() {
+                self.storage.store_hashed_storages(current_hashed_address.unwrap(), storage_entries, 0).await?;
+                storage_entries = Vec::new();
+            }
+            current_hashed_address = Some(hashed_address);
+
+            storage_entries.push((storage_entry.key, storage_entry.value));
+            total_storage_slots += 1;
+
+            if total_storage_slots % 10000 == 0 {
+                info!("Processed {} storage slots, last hashed address: {:?}", total_storage_slots, current_hashed_address);
+            }
+
+            if storage_entries.len() >= 10000 {
+                info!("Storing {} storage entries", storage_entries.len());
+                self.storage.store_hashed_storages(hashed_address, storage_entries, 0).await?;
+                storage_entries = Vec::new();
+            }
+        }
+
+        if storage_entries.len() > 0 && current_hashed_address.is_some() {
+            info!("Storing final {} storage entries", storage_entries.len());
+            self.storage.store_hashed_storages(current_hashed_address.unwrap(), storage_entries, 0).await?;
+        }
+
+        info!("Leaf nodes backfill complete: {} accounts, {} storage slots", total_accounts, total_storage_slots);
         Ok(())
     }
 
@@ -205,6 +237,7 @@ where
 
 
     async fn backfill_preimages(&self) -> eyre::Result<()> {
+        self.backfill_leaf_nodes().await?;
         self.backfill_storages_trie().await?;
         self.backfill_accounts_trie().await?;
         let ChainInfo { best_number, best_hash } = self.ctx.provider().chain_info().unwrap();
