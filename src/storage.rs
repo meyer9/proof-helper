@@ -6,22 +6,6 @@ use std::fmt::Debug;
 use auto_impl::auto_impl;
 use reth::primitives::Account;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PreimageEntry {
-    pub block_number: u64,
-    pub path: Nibbles,
-    pub hashed_address: Option<B256>,
-    pub branch: Option<BranchNodeCompact>,
-}
-
-/// Batch of preimages to be stored together
-#[derive(Debug, Clone)]
-pub struct TrieBranchesBatch {
-    /// Block number for all items in this batch
-    pub block_number: u64,
-    /// Map of hash to preimage data
-    pub items: Vec<PreimageEntry>,
-}
 
 /// Error types for preimage storage operations
 #[derive(Debug, thiserror::Error)]
@@ -55,6 +39,24 @@ impl From<rusqlite::Error> for ExternalStorageError {
 /// Result type for storage operations
 pub type ExternalStorageResult<T> = Result<T, ExternalStorageError>;
 
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BranchNodeEntry {
+    pub block_number: u64,
+    pub path: Nibbles,
+    pub hashed_address: Option<B256>,
+    pub branch: Option<BranchNodeCompact>,
+}
+
+/// Batch of preimages to be stored together
+#[derive(Debug, Clone)]
+pub struct TrieBranchesBatch {
+    /// Block number for all items in this batch
+    pub block_number: u64,
+    /// Map of hash to preimage data
+    pub items: Vec<BranchNodeEntry>,
+}
+
 pub trait ExternalTrieCursor: Send + Sync {
     fn seek_exact(&mut self, path: Nibbles) -> ExternalStorageResult<Option<(Nibbles, BranchNodeCompact)>>;
     fn seek(&mut self, path: Nibbles) -> ExternalStorageResult<Option<(Nibbles, BranchNodeCompact)>>;
@@ -72,6 +74,9 @@ pub trait ExternalHashedCursor: Send + Sync {
 
     /// Move the cursor to the next entry and return it.
     fn next(&mut self) -> ExternalStorageResult<Option<(B256, Self::Value)>>;
+
+    /// Returns `true` if there are no entries for a given key.
+    fn is_storage_empty(&mut self) -> ExternalStorageResult<bool>;
 }
 
 /// Trait for storing and retrieving preimage data
@@ -126,12 +131,16 @@ pub trait ExternalStateStore: Send + Sync + Debug {
     /// Health check for the storage backend
     async fn health_check(&self) -> ExternalStorageResult<()>;
 
-    /// Get a cursor for the storage backend
+    /// Get a trie cursor for the storage backend
     fn trie_cursor(&self, hashed_address: Option<B256>, max_block_number: u64) -> ExternalStorageResult<Self::TrieCursor>;
 
+    /// Get a storage cursor for the storage backend
     fn storage_hashed_cursor(&self, hashed_address: B256, max_block_number: u64) -> ExternalStorageResult<Self::StorageCursor>;
 
+    /// Get an account hashed cursor for the storage backend
     fn account_hashed_cursor(&self, max_block_number: u64) -> ExternalStorageResult<Self::AccountHashedCursor>;
+
+    fn find_last_stored_storage_slot(&self) -> ExternalStorageResult<Option<(B256, B256)>>;
 }
 
 impl TrieBranchesBatch {

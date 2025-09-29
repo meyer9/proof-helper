@@ -1,12 +1,11 @@
 use futures_util::TryStreamExt;
 use op_reth::node::OpNode;
 use reth::{
-    api::{FullNodeComponents, NodePrimitives}, builder::NodeTypes, chainspec::ChainInfo, core::primitives::AlloyBlockHeader, primitives::RecoveredBlock, providers::{BlockNumReader, DBProvider, DatabaseProviderFactory, HashedPostStateProvider, StateProviderFactory, StateReader}, revm::primitives::{map::FbBuildHasher, FixedBytes, HashMap}
+    api::{FullNodeComponents, NodePrimitives}, builder::NodeTypes, chainspec::ChainInfo, core::primitives::AlloyBlockHeader, primitives::RecoveredBlock, providers::{BlockNumReader, HashedPostStateProvider, StateProviderFactory, StateReader}, revm::primitives::{map::FbBuildHasher, FixedBytes, HashMap}
 };
 
-use reth_db_api::{cursor::{DbCursorRO, DbDupCursorRO}, tables, transaction::DbTx};
 use reth_exex::{ExExContext, ExExEvent, ExExNotification};
-use reth_tracing::tracing::{info, warn};
+use reth_tracing::tracing::info;
 use reth_trie::{updates::{StorageTrieUpdates, TrieUpdates}, HashedPostState};
 use std::sync::Arc;
 
@@ -16,12 +15,13 @@ mod storage;
 mod rpc;
 mod provider;
 mod proof;
+mod backfill;
 
 use config::{ProofHelperConfig, StorageBackend};
 use sqlite::SqlitePreimageStore;
-use storage::{TrieBranchesBatch, PreimageEntry, ExternalStateStore};
+use storage::{TrieBranchesBatch, BranchNodeEntry, ExternalStateStore};
 
-use crate::{rpc::{EthApiExt, EthApiOverrideServer}};
+use crate::{rpc::{EthApiExt, EthApiOverrideServer}, backfill::BackfillManager};
 
 /// Proof Helper ExEx - processes blocks and tracks state changes
 pub struct ProofHelper<Node, PreimageStore>
@@ -37,209 +37,17 @@ impl<Node, Primitives, P> ProofHelper<Node, P>
 where
     Node: FullNodeComponents<Types: NodeTypes<Primitives = Primitives>>,
     Primitives: NodePrimitives,
-    P: ExternalStateStore,
+    P: ExternalStateStore + Clone,
 {
     /// Create a new ProofHelper instance
     pub fn new(ctx: ExExContext<Node>, storage: P) -> Self {
         Self { ctx, storage }
     }
 
-    async fn backfill_leaf_nodes(&self) -> eyre::Result<()> {
-        let db_provider = self.ctx.provider().database_provider_ro()?;
-        let tx = db_provider.tx_ref();
-        let mut hashed_accounts_cursor = tx.cursor_read::<tables::HashedAccounts>()?;
-        let mut account_entries = Vec::new();
-        
-        let mut total_accounts = 0;
-        let mut total_storage_slots = 0;
-        let mut last_account = None;
-        
-        loop {
-            let entry = hashed_accounts_cursor.next()?;
-
-            let Some(entry) = entry else {
-                break;
-            };
-
-            let hashed_account = entry.0;
-            let account = entry.1;
-            account_entries.push((hashed_account, Some(account)));
-            last_account = Some(hashed_account);
-            total_accounts += 1;
-
-            if total_accounts % 10000 == 0 {
-                info!("Processed {} accounts, {} total storage slots, last account: {:?}", total_accounts, total_storage_slots, last_account);
-            }
-
-            if account_entries.len() >= 10000 {
-                info!("Storing {} account entries, total accounts: {}", account_entries.len(), total_accounts);
-                self.storage.store_hashed_accounts(account_entries, 0).await?;
-                account_entries = Vec::new();
-            }
-        }
-
-        if account_entries.len() > 0 {
-            info!("Storing final {} account entries", account_entries.len());
-            self.storage.store_hashed_accounts(account_entries, 0).await?;
-        }
-
-        let mut hashed_storages_cursor = tx.cursor_dup_read::<tables::HashedStorages>()?;
-        let mut storage_entries = Vec::new();
-        let mut current_hashed_address = None;
-        loop {
-            let entry = hashed_storages_cursor.next_dup()?;
-            let Some(entry) = entry else {
-                break;
-            };
-
-            let hashed_address = entry.0;
-            let storage_entry = entry.1;
-
-            if current_hashed_address != Some(hashed_address) && storage_entries.len() > 0 && current_hashed_address.is_some() {
-                self.storage.store_hashed_storages(current_hashed_address.unwrap(), storage_entries, 0).await?;
-                storage_entries = Vec::new();
-            }
-            current_hashed_address = Some(hashed_address);
-
-            storage_entries.push((storage_entry.key, storage_entry.value));
-            total_storage_slots += 1;
-
-            if total_storage_slots % 10000 == 0 {
-                info!("Processed {} storage slots, last hashed address: {:?}", total_storage_slots, current_hashed_address);
-            }
-
-            if storage_entries.len() >= 10000 {
-                info!("Storing {} storage entries", storage_entries.len());
-                self.storage.store_hashed_storages(hashed_address, storage_entries, 0).await?;
-                storage_entries = Vec::new();
-            }
-        }
-
-        if storage_entries.len() > 0 && current_hashed_address.is_some() {
-            info!("Storing final {} storage entries", storage_entries.len());
-            self.storage.store_hashed_storages(current_hashed_address.unwrap(), storage_entries, 0).await?;
-        }
-
-        info!("Leaf nodes backfill complete: {} accounts, {} storage slots", total_accounts, total_storage_slots);
-        Ok(())
-    }
-
-    async fn backfill_accounts_trie(&self) -> eyre::Result<()> {
-        let db_provider = self.ctx.provider().database_provider_ro()?;
-        let db = db_provider.tx_ref();
-
-        // count entries in AccountsTrie and StorageTrie
-        let mut accounts_trie_cursor = db.cursor_read::<tables::AccountsTrie>()?;
-
-        let mut entry = accounts_trie_cursor.first()?;
-        let mut batch: TrieBranchesBatch = TrieBranchesBatch::new(0);
-
-        let mut count = 0;
-        loop {
-            if let Some(entry) = entry {
-                // let key = entry.0;
-                // let value = entry.1;
-                batch.items.push(PreimageEntry {
-                    block_number: 0,
-                    path: entry.0.0,
-                    hashed_address: None,
-                    branch: Some(entry.1),
-                });
-                count += 1;
-            } else {
-                break;
-            }
-
-            if count % 10000 == 0 {
-                info!("AccountsTrie has {} entries", count);
-                self.storage.store_trie_branches(batch).await?;
-                batch = TrieBranchesBatch::new(0);
-            }
-
-            entry = accounts_trie_cursor.next()?;
-        }
-
-        if batch.items.len() > 0 {
-            self.storage.store_trie_branches(batch).await?;
-        }
-
-        info!("AccountsTrie has {} entries", count);
-
-        Ok(())
-    }
-
-    async fn backfill_storages_trie(&self) -> eyre::Result<()> {
-        let db_provider = self.ctx.provider().database_provider_ro()?;
-        let db = db_provider.tx_ref();
-
-        // count entries in AccountsTrie and StorageTrie
-        let mut hashed_storages_cursor = db.cursor_dup_read::<tables::HashedStorages>()?;
-        let mut storages_trie_cursor = db.cursor_dup_read::<tables::StoragesTrie>()?;
-
-        let mut storage_entry = hashed_storages_cursor.first()?;
-        let mut batch: TrieBranchesBatch = TrieBranchesBatch::new(0);
-        let mut count = 0;
-        loop {
-            if let Some(storage_entry) = storage_entry {
-                let address = storage_entry.0;
-
-                let mut address_count = 0;
-
-                // save all the entries for this address
-                let account_entry = storages_trie_cursor.walk_dup(Some(address), None)?;
-                for res in account_entry {
-                    let Ok((account, branch)) = res else {
-                        warn!("Error walking account entry: {}", res.err().unwrap());
-                        break;
-                    };
-
-                    if account != address {
-                        warn!("Account address mismatch: {} != {}", account, address);
-                        break;
-                    }
-
-                    batch.items.push(PreimageEntry {
-                        block_number: 0,
-                        path: branch.nibbles.0,
-                        hashed_address: Some(account),
-                        branch: Some(branch.node),
-                    });
-
-                    if (count + address_count) % 10000 == 0 {
-                        info!("StoragesTrie has {} entries", count + address_count);
-                        self.storage.store_trie_branches(batch).await?;
-                        batch = TrieBranchesBatch::new(0);
-                    }
-
-                    address_count += 1;
-                }
-
-                if address_count > 100 {
-                    info!("StoragesTrie has {} entries for address {}", address_count, address);
-                }
-                    
-                count += address_count;
-            } else {
-                break;
-            }
-
-
-            storage_entry = hashed_storages_cursor.next_no_dup()?;
-        }
-        info!("StoragesTrie has {} entries", count);
-
-        if batch.items.len() > 0 {
-            self.storage.store_trie_branches(batch).await?;
-        }
-
-        Ok(())
-    }
-
-
     async fn backfill_preimages(&self) -> eyre::Result<()> {
-        self.backfill_leaf_nodes().await?;
-        self.backfill_storages_trie().await?;
-        self.backfill_accounts_trie().await?;
+        let backfill_manager: BackfillManager<Node, P> = BackfillManager::new(self.ctx.provider().clone(), self.storage.clone());
+        backfill_manager.backfill_preimages().await?;
+        
         let ChainInfo { best_number, best_hash } = self.ctx.provider().chain_info().unwrap();
         self.storage.set_earliest_block_number(best_number, best_hash).await?;
         Ok(())
@@ -265,7 +73,7 @@ where
             );
             for (nibbles, maybe_updated) in storage_updates.into_iter().filter(|(n, _)| !n.is_empty()) {
                 num_entries += 1;
-                preimage_batch.items.push(PreimageEntry {
+                preimage_batch.items.push(BranchNodeEntry {
                     block_number,
                     path: *nibbles,
                     hashed_address: Some(*hashed_address),
@@ -311,7 +119,7 @@ where
                 Some(node) => {
                     if !nibbles.is_empty() {
                         num_entries += 1;
-                        batch_to_store.items.push(PreimageEntry {
+                        batch_to_store.items.push(BranchNodeEntry {
                             block_number: block.number(),
                             path: nibbles,
                             hashed_address: None,
@@ -321,7 +129,7 @@ where
                 }
                 None => {
                     num_entries += 1;
-                    batch_to_store.items.push(PreimageEntry {
+                    batch_to_store.items.push(BranchNodeEntry {
                         block_number: block.number(),
                         path: nibbles,
                         hashed_address: None,

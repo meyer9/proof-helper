@@ -90,8 +90,13 @@ impl SqlitePreimageStoreAccountCursor {
         .map_err(Into::<ExternalStorageError>::into)?;
 
         if let Some(value_bytes) = result {
-            let account = Account::from_compact(&value_bytes, value_bytes.len()).0;
-            Ok(Some(account))
+            // If the value is empty, it means the account was deleted
+            if value_bytes.is_empty() {
+                Ok(None)
+            } else {
+                let account = Account::from_compact(&value_bytes, value_bytes.len()).0;
+                Ok(Some(account))
+            }
         } else {
             Ok(None)
         }
@@ -197,6 +202,10 @@ impl ExternalHashedCursor for SqlitePreimageStoreStorageCursor {
         self.last_seeked = result.as_ref().map(|(key, _)| *key);
         Ok(result)
     }
+
+    fn is_storage_empty(&mut self) -> ExternalStorageResult<bool> {
+        Ok(self.find_next_valid_storage(&B256::ZERO)?.is_none())
+    }
 }
 
 impl ExternalHashedCursor for SqlitePreimageStoreAccountCursor {
@@ -223,6 +232,10 @@ impl ExternalHashedCursor for SqlitePreimageStoreAccountCursor {
 
         self.last_seeked = result.as_ref().map(|(key, _)| *key);
         Ok(result)
+    }
+
+    fn is_storage_empty(&mut self) -> ExternalStorageResult<bool> {
+        Ok(self.find_next_valid_account(&B256::ZERO)?.is_none())
     }
 }
 
@@ -536,6 +549,19 @@ impl ExternalStateStore for SqlitePreimageStore {
     type TrieCursor = SqlitePreimageStoreCursor;
     type StorageCursor = SqlitePreimageStoreStorageCursor;
     type AccountHashedCursor = SqlitePreimageStoreAccountCursor;
+
+
+    fn find_last_stored_storage_slot(&self) -> ExternalStorageResult<Option<(B256, B256)>> {
+        let result = self.connect()?.query_row(
+            "SELECT hashed_address, storage_key FROM storage_nodes WHERE block_number = ? ORDER BY hashed_address DESC, storage_key DESC LIMIT 1",
+            params![0],
+            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+        ).optional()
+        .map_err(Into::<ExternalStorageError>::into)?;
+
+        Ok(result.map(|(hashed_address, storage_key)| (B256::from_slice(&hashed_address), B256::from_slice(&storage_key))))
+
+    }
 
     async fn store_trie_branch(
         &self,
@@ -1293,7 +1319,7 @@ mod tests {
         let account = create_test_account();
         
         // Store account
-        store.store_hashed_accounts(vec![(account_key, account.clone())], 50).await.unwrap();
+        store.store_hashed_accounts(vec![(account_key, Some(account.clone()))], 50).await.unwrap();
         
         // Retrieve via cursor
         let mut cursor = store.account_hashed_cursor(100).unwrap();
@@ -1315,7 +1341,7 @@ mod tests {
         ];
         
         // Store accounts
-        store.store_hashed_accounts(accounts.clone(), 50).await.unwrap();
+        store.store_hashed_accounts(accounts.clone().into_iter().map(|(key, account)| (key, Some(account))).collect(), 50).await.unwrap();
         
         let mut cursor = store.account_hashed_cursor(100).unwrap();
         
@@ -1352,8 +1378,8 @@ mod tests {
         };
         
         // Store account at different blocks
-        store.store_hashed_accounts(vec![(account_key, account_v1.clone())], 50).await.unwrap();
-        store.store_hashed_accounts(vec![(account_key, account_v2.clone())], 100).await.unwrap();
+        store.store_hashed_accounts(vec![(account_key, Some(account_v1.clone()))], 50).await.unwrap();
+        store.store_hashed_accounts(vec![(account_key, Some(account_v2.clone()))], 100).await.unwrap();
         
         // Cursor with max_block_number=75 should see v1
         let mut cursor75 = store.account_hashed_cursor(75).unwrap();
@@ -1512,7 +1538,7 @@ mod tests {
         let account_key = B256::repeat_byte(0x80); // Middle value
         let account = create_test_account();
         
-        store.store_hashed_accounts(vec![(account_key, account)], 50).await.unwrap();
+        store.store_hashed_accounts(vec![(account_key, Some(account))], 50).await.unwrap();
         
         let mut cursor = store.account_hashed_cursor(100).unwrap();
         
@@ -1546,7 +1572,7 @@ mod tests {
         }
         
         // Store in batch
-        store.store_hashed_accounts(accounts.clone(), 50).await.unwrap();
+        store.store_hashed_accounts(accounts.clone().into_iter().map(|(key, account)| (key, Some(account))).collect(), 50).await.unwrap();
         
         // Verify all accounts can be retrieved
         let mut cursor = store.account_hashed_cursor(100).unwrap();
@@ -1561,5 +1587,182 @@ mod tests {
         let result = cursor.seek(test_key).unwrap().unwrap();
         assert_eq!(result.0, test_key);
         assert_eq!(result.1.nonce, 42);
+    }
+
+    // 8. is_storage_empty Tests
+
+    #[tokio::test]
+    async fn test_storage_cursor_is_storage_empty_when_empty() {
+        let store = setup_test_store().await;
+        let hashed_address = B256::repeat_byte(0x01);
+        
+        // Create storage cursor for empty storage
+        let mut cursor = store.storage_hashed_cursor(hashed_address, 100).unwrap();
+        
+        // Should return true for empty storage
+        assert!(cursor.is_storage_empty().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_storage_cursor_is_storage_empty_when_not_empty() {
+        let store = setup_test_store().await;
+        let hashed_address = B256::repeat_byte(0x01);
+        let storage_key = B256::repeat_byte(0x10);
+        
+        // Store some storage data
+        store.store_hashed_storages(hashed_address, vec![(storage_key, U256::from(100))], 50).await.unwrap();
+        
+        // Create storage cursor
+        let mut cursor = store.storage_hashed_cursor(hashed_address, 100).unwrap();
+        
+        // Should return false for non-empty storage
+        assert!(!cursor.is_storage_empty().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_storage_cursor_is_storage_empty_with_different_address() {
+        let store = setup_test_store().await;
+        let address1 = B256::repeat_byte(0x01);
+        let address2 = B256::repeat_byte(0x02);
+        let storage_key = B256::repeat_byte(0x10);
+        
+        // Store storage data for address1 only
+        store.store_hashed_storages(address1, vec![(storage_key, U256::from(100))], 50).await.unwrap();
+        
+        // Cursor for address1 should not be empty
+        let mut cursor1 = store.storage_hashed_cursor(address1, 100).unwrap();
+        assert!(!cursor1.is_storage_empty().unwrap());
+        
+        // Cursor for address2 should be empty
+        let mut cursor2 = store.storage_hashed_cursor(address2, 100).unwrap();
+        assert!(cursor2.is_storage_empty().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_storage_cursor_is_storage_empty_with_block_filtering() {
+        let store = setup_test_store().await;
+        let hashed_address = B256::repeat_byte(0x01);
+        let storage_key = B256::repeat_byte(0x10);
+        
+        // Store storage data at block 100
+        store.store_hashed_storages(hashed_address, vec![(storage_key, U256::from(100))], 100).await.unwrap();
+        
+        // Cursor with max_block_number=50 should see empty storage
+        let mut cursor_early = store.storage_hashed_cursor(hashed_address, 50).unwrap();
+        assert!(cursor_early.is_storage_empty().unwrap());
+        
+        // Cursor with max_block_number=150 should see non-empty storage
+        let mut cursor_late = store.storage_hashed_cursor(hashed_address, 150).unwrap();
+        assert!(!cursor_late.is_storage_empty().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_storage_cursor_is_storage_empty_after_deletion() {
+        let store = setup_test_store().await;
+        let hashed_address = B256::repeat_byte(0x01);
+        let storage_key = B256::repeat_byte(0x10);
+        
+        // Store storage data, then "delete" it by storing zero value
+        store.store_hashed_storages(hashed_address, vec![(storage_key, U256::from(100))], 50).await.unwrap();
+        store.store_hashed_storages(hashed_address, vec![(storage_key, U256::ZERO)], 100).await.unwrap();
+        
+        // Cursor before deletion should not be empty
+        let mut cursor_before = store.storage_hashed_cursor(hashed_address, 75).unwrap();
+        assert!(!cursor_before.is_storage_empty().unwrap());
+        
+        // Cursor after deletion should still not be empty (zero value is still a value)
+        let mut cursor_after = store.storage_hashed_cursor(hashed_address, 150).unwrap();
+        assert!(!cursor_after.is_storage_empty().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_account_cursor_is_storage_empty_when_empty() {
+        let store = setup_test_store().await;
+        
+        // Create account cursor for empty accounts
+        let mut cursor = store.account_hashed_cursor(100).unwrap();
+        
+        // Should return true for empty accounts
+        assert!(cursor.is_storage_empty().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_account_cursor_is_storage_empty_when_not_empty() {
+        let store = setup_test_store().await;
+        let account_key = B256::repeat_byte(0x01);
+        let account = create_test_account();
+        
+        // Store account data
+        store.store_hashed_accounts(vec![(account_key, Some(account))], 50).await.unwrap();
+        
+        // Create account cursor
+        let mut cursor = store.account_hashed_cursor(100).unwrap();
+        
+        // Should return false for non-empty accounts
+        assert!(!cursor.is_storage_empty().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_account_cursor_is_storage_empty_with_block_filtering() {
+        let store = setup_test_store().await;
+        let account_key = B256::repeat_byte(0x01);
+        let account = create_test_account();
+        
+        // Store account data at block 100
+        store.store_hashed_accounts(vec![(account_key, Some(account))], 100).await.unwrap();
+        
+        // Cursor with max_block_number=50 should see empty accounts
+        let mut cursor_early = store.account_hashed_cursor(50).unwrap();
+        assert!(cursor_early.is_storage_empty().unwrap());
+        
+        // Cursor with max_block_number=150 should see non-empty accounts
+        let mut cursor_late = store.account_hashed_cursor(150).unwrap();
+        assert!(!cursor_late.is_storage_empty().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_account_cursor_is_storage_empty_after_deletion() {
+        let store = setup_test_store().await;
+        let account_key = B256::repeat_byte(0x01);
+        let account = create_test_account();
+        
+        // Store account data, then "delete" it by storing empty value
+        store.store_hashed_accounts(vec![(account_key, Some(account))], 50).await.unwrap();
+        store.store_hashed_accounts(vec![(account_key, None)], 100).await.unwrap();
+        
+        // Cursor before deletion should not be empty
+        let mut cursor_before = store.account_hashed_cursor(75).unwrap();
+        assert!(!cursor_before.is_storage_empty().unwrap());
+        
+        // Cursor after deletion should be empty (None value means deleted)
+        let mut cursor_after = store.account_hashed_cursor(150).unwrap();
+        assert!(cursor_after.is_storage_empty().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_is_storage_empty_does_not_affect_cursor_state() {
+        let store = setup_test_store().await;
+        let hashed_address = B256::repeat_byte(0x01);
+        let storage_key = B256::repeat_byte(0x10);
+        
+        // Store storage data
+        store.store_hashed_storages(hashed_address, vec![(storage_key, U256::from(100))], 50).await.unwrap();
+        
+        let mut cursor = store.storage_hashed_cursor(hashed_address, 100).unwrap();
+        
+        // Perform some navigation
+        let result1 = cursor.seek(storage_key).unwrap().unwrap();
+        assert_eq!(result1.0, storage_key);
+        
+        // Check is_storage_empty
+        assert!(!cursor.is_storage_empty().unwrap());
+        
+        // Navigation should still work normally after is_storage_empty call
+        let result2 = cursor.next().unwrap();
+        assert!(result2.is_none()); // No more entries
+        
+        // Seek should still work
+        let result3 = cursor.seek(storage_key).unwrap().unwrap();
+        assert_eq!(result3.0, storage_key);
     }
 }

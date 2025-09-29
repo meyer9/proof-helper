@@ -116,7 +116,7 @@ impl<'a, P: ExternalStateStore + Clone, Provider: DBProvider + Send + Sync> Stat
         address: Address,
         slots: &[B256],
     ) -> ProviderResult<AccountProof> {
-        Proof::overlay_account_proof(self.tx(), self.storage.clone(), self.block_number, input, address, slots).map_err(ProviderError::from)
+        Proof::overlay_account_proof(self.storage.clone(), self.block_number, input, address, slots).map_err(ProviderError::from)
     }
 
     fn multiproof(
