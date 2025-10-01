@@ -4,7 +4,6 @@ use jsonrpsee::{
 };
 use jsonrpsee_core::RpcResult;
 use reth::{providers::{BlockIdReader, DatabaseProviderFactory, ProviderError, ProviderResult, StateProviderBox}, revm::{primitives::{Address}}, rpc::{api::eth::helpers::FullEthApi, server_types::eth::EthApiError, types::{serde_helpers::JsonStorageKey, BlockId, EIP1186AccountProofResponse}}};
-use op_alloy_network::Optimism;
 
 
 use crate::{storage::ExternalStateStore, provider::ExternalOverlayStateProviderRef};
@@ -51,7 +50,7 @@ pub struct EthApiExt<Eth, P, Provider> {
 
 impl<Eth, P, Provider> EthApiExt<Eth, P, Provider>
 where
-    Eth: FullEthApi<NetworkTypes = Optimism> + Send + Sync + 'static,
+    Eth: FullEthApi + Send + Sync + 'static,
     jsonrpsee_types::error::ErrorObject<'static>: From<Eth::Error>,
     P: ExternalStateStore + Clone + 'static,
     Provider: DatabaseProviderFactory + 'static,
@@ -87,7 +86,7 @@ impl<Eth, P, Provider> EthApiExt<Eth, P, Provider> {
 #[async_trait]
 impl<Eth, P, Provider> EthApiOverrideServer for EthApiExt<Eth, P, Provider>
 where
-    Eth: FullEthApi<NetworkTypes = Optimism> + Send + Sync + 'static,
+    Eth: FullEthApi + Send + Sync + 'static,
     jsonrpsee_types::error::ErrorObject<'static>: From<Eth::Error>,
     P: ExternalStateStore + Clone + 'static,
     Provider: DatabaseProviderFactory + 'static,

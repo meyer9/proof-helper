@@ -17,6 +17,7 @@ reth-evm = { git = "https://github.com/paradigmxyz/reth.git" }
 reth-stateless = { git = "https://github.com/paradigmxyz/reth.git" }
 reth-codecs = { git = "https://github.com/paradigmxyz/reth.git" }
 reth-execution-errors = { git = "https://github.com/paradigmxyz/reth.git" }
+
 alloy-rlp = "0.3.12"
 
 op-alloy-rpc-jsonrpsee = { version = "0.19.0", default-features = false }
@@ -28,6 +29,7 @@ auto_impl = "1"
 jsonrpsee = "0.26.0"
 jsonrpsee-core = "0.26.0"
 jsonrpsee-types = "0.26.0"
+tracing = "0.1.0"
 
 eyre = "0.6" # Easy error handling
 futures-util = "0.3" # Stream utilities for consuming notifications
@@ -36,28 +38,26 @@ async-trait = "0.1"
 tokio = { version = "1.0", features = ["sync", "rt", "macros"] }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
-aws-config = "1.1"
-aws-sdk-dynamodb = "1.11"
-aws-smithy-runtime-api = "1.1"
 hex = "0.4"
 rusqlite = { version = "0.31", features = ["bundled", "functions", "blob"] }
 
 [dev-dependencies]
 tempfile = "3.0"
 
-# [patch."https://github.com/paradigmxyz/reth.git"]
-# reth-trie = { path = "../reth/crates/trie/trie" }
-# reth-trie-db = { path = "../reth/crates/trie/db" }
-# reth = { path = "../reth/bin/reth" }
-# op-reth = { path = "../reth/crates/optimism/bin" }
-# reth-exex = { path = "../reth/crates/exex/exex" }
-# reth-node-ethereum = { path = "../reth/crates/ethereum/node" }
-# reth-tracing = { path = "../reth/crates/tracing" }
-# reth-db-api = { path = "../reth/crates/storage/db-api" }
-# reth-execution-types = { path = "../reth/crates/evm/execution-types" }
-# reth-evm = { path = "../reth/crates/evm/evm" }
-# reth-stateless = { path = "../reth/crates/stateless" }
-
+[patch."https://github.com/paradigmxyz/reth.git"]
+reth-trie = { path = "../reth/crates/trie/trie" }
+reth-trie-db = { path = "../reth/crates/trie/db" }
+reth = { path = "../reth/bin/reth" }
+op-reth = { path = "../reth/crates/optimism/bin" }
+reth-exex = { path = "../reth/crates/exex/exex" }
+reth-node-ethereum = { path = "../reth/crates/ethereum/node" }
+reth-tracing = { path = "../reth/crates/tracing" }
+reth-db-api = { path = "../reth/crates/storage/db-api" }
+reth-execution-types = { path = "../reth/crates/evm/execution-types" }
+reth-evm = { path = "../reth/crates/evm/evm" }
+reth-stateless = { path = "../reth/crates/stateless" }
+reth-codecs = { path = "../reth/crates/storage/codecs" }
+reth-execution-errors = { path = "../reth/crates/evm/execution-errors" }
 
 # [patch.crates-io]
 # alloy-trie = { path = "../trie" }

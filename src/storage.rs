@@ -1,11 +1,10 @@
 use alloy_primitives::U256;
-use reth::revm::primitives::B256;
-use reth_db_api::DatabaseError;
-use reth_trie::{BranchNodeCompact, Nibbles};
-use std::fmt::Debug;
 use auto_impl::auto_impl;
 use reth::primitives::Account;
-
+use reth::{primitives::StorageEntry, revm::primitives::B256};
+use reth_db_api::DatabaseError;
+use reth_trie::{BranchNodeCompact, Nibbles, StorageTrieEntry};
+use std::fmt::Debug;
 
 /// Error types for preimage storage operations
 #[derive(Debug, thiserror::Error)]
@@ -39,10 +38,8 @@ impl From<rusqlite::Error> for ExternalStorageError {
 /// Result type for storage operations
 pub type ExternalStorageResult<T> = Result<T, ExternalStorageError>;
 
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BranchNodeEntry {
-    pub block_number: u64,
     pub path: Nibbles,
     pub hashed_address: Option<B256>,
     pub branch: Option<BranchNodeCompact>,
@@ -58,8 +55,14 @@ pub struct TrieBranchesBatch {
 }
 
 pub trait ExternalTrieCursor: Send + Sync {
-    fn seek_exact(&mut self, path: Nibbles) -> ExternalStorageResult<Option<(Nibbles, BranchNodeCompact)>>;
-    fn seek(&mut self, path: Nibbles) -> ExternalStorageResult<Option<(Nibbles, BranchNodeCompact)>>;
+    fn seek_exact(
+        &mut self,
+        path: Nibbles,
+    ) -> ExternalStorageResult<Option<(Nibbles, BranchNodeCompact)>>;
+    fn seek(
+        &mut self,
+        path: Nibbles,
+    ) -> ExternalStorageResult<Option<(Nibbles, BranchNodeCompact)>>;
     fn next(&mut self) -> ExternalStorageResult<Option<(Nibbles, BranchNodeCompact)>>;
     fn current(&mut self) -> ExternalStorageResult<Option<Nibbles>>;
 }
@@ -80,10 +83,10 @@ pub trait ExternalHashedCursor: Send + Sync {
 }
 
 /// Trait for storing and retrieving preimage data
-/// 
+///
 /// This trait provides an abstraction over different storage backends (DynamoDB, etc.)
 /// and supports batch operations for efficient storage of preimages with block-based indexing.
-/// 
+///
 /// Storage model: hash (primary key) -> preimage data, with block_number as secondary index
 #[async_trait::async_trait]
 #[auto_impl(Arc)]
@@ -92,9 +95,9 @@ pub trait ExternalStateStore: Send + Sync + Debug {
     type StorageCursor: ExternalHashedCursor<Value = U256>;
     type AccountHashedCursor: ExternalHashedCursor<Value = Account>;
 
-    /// Store a single preimage. Storing None will store a NULL value which will be used to 
+    /// Store a single preimage. Storing None will store a NULL value which will be used to
     /// signal that the preimage was deleted at that block.
-    /// 
+    ///
     /// # Arguments
     /// * `hash` - Hash of the preimage (used as primary key)
     /// * `preimage` - The preimage data to store
@@ -108,39 +111,68 @@ pub trait ExternalStateStore: Send + Sync + Debug {
     ) -> ExternalStorageResult<()>;
 
     /// Store multiple preimages in a batch operation
-    /// 
+    ///
     /// This should be more efficient than multiple individual stores
-    /// 
+    ///
     /// # Arguments
     /// * `batch` - Batch of preimages to store
     async fn store_trie_branches(&self, batch: TrieBranchesBatch) -> ExternalStorageResult<()>;
 
-    async fn store_hashed_accounts(&self, accounts: Vec<(B256, Option<Account>)>, block_number: u64) -> ExternalStorageResult<()>;
+    async fn store_hashed_accounts(
+        &self,
+        accounts: Vec<(B256, Option<Account>)>,
+        block_number: u64,
+    ) -> ExternalStorageResult<()>;
 
-    async fn store_hashed_storages(&self, hashed_address: B256, storages: Vec<(B256, U256)>, block_number: u64) -> ExternalStorageResult<()>;
+    async fn store_hashed_storages(
+        &self,
+        storages: Vec<(B256, StorageEntry)>,
+        block_number: u64,
+    ) -> ExternalStorageResult<()>;
 
     /// Get the earliest block number and hash that has been stored
-    /// 
+    ///
     /// This is used to determine the block number of trie nodes with block number 0.
     /// All earliest block numbers are stored in 0 to reduce updates required to prune trie nodes.
     async fn get_earliest_block_number(&self) -> ExternalStorageResult<Option<(u64, B256)>>;
 
+    /// Get the latest block number that has been stored
+    fn get_latest_block_number(&self) -> ExternalStorageResult<u64>;
+
     /// Set the earliest block number and hash that has been stored
-    async fn set_earliest_block_number(&self, block_number: u64, hash: B256) -> ExternalStorageResult<()>;
+    async fn set_earliest_block_number(
+        &self,
+        block_number: u64,
+        hash: B256,
+    ) -> ExternalStorageResult<()>;
 
     /// Health check for the storage backend
     async fn health_check(&self) -> ExternalStorageResult<()>;
 
     /// Get a trie cursor for the storage backend
-    fn trie_cursor(&self, hashed_address: Option<B256>, max_block_number: u64) -> ExternalStorageResult<Self::TrieCursor>;
+    fn trie_cursor(
+        &self,
+        hashed_address: Option<B256>,
+        max_block_number: u64,
+    ) -> ExternalStorageResult<Self::TrieCursor>;
 
     /// Get a storage cursor for the storage backend
-    fn storage_hashed_cursor(&self, hashed_address: B256, max_block_number: u64) -> ExternalStorageResult<Self::StorageCursor>;
+    fn storage_hashed_cursor(
+        &self,
+        hashed_address: B256,
+        max_block_number: u64,
+    ) -> ExternalStorageResult<Self::StorageCursor>;
 
     /// Get an account hashed cursor for the storage backend
-    fn account_hashed_cursor(&self, max_block_number: u64) -> ExternalStorageResult<Self::AccountHashedCursor>;
+    fn account_hashed_cursor(
+        &self,
+        max_block_number: u64,
+    ) -> ExternalStorageResult<Self::AccountHashedCursor>;
 
-    fn find_last_stored_storage_slot(&self) -> ExternalStorageResult<Option<(B256, B256)>>;
+    fn get_last_storage_leaf(&self) -> ExternalStorageResult<Option<(B256, B256)>>;
+    fn get_last_account_leaf(&self) -> ExternalStorageResult<Option<B256>>;
+    fn get_last_storage_branch(&self) -> ExternalStorageResult<Option<(B256, Nibbles)>>;
+    fn get_last_account_branch(&self) -> ExternalStorageResult<Option<Nibbles>>;
 }
 
 impl TrieBranchesBatch {

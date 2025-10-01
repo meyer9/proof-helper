@@ -1,12 +1,11 @@
 use crate::storage::{ExternalHashedCursor, ExternalStateStore, ExternalTrieCursor as ExternalDBTrieCursor};
 use alloy_primitives::{keccak256, map::HashMap, Address, B256, U256};
 use reth::primitives::Account;
-use reth_db_api::{transaction::DbTx, DatabaseError};
+use reth_db_api::{DatabaseError};
 use reth_execution_errors::StateProofError;
 use reth_trie::{
     hashed_cursor::{HashedCursor, HashedCursorFactory, HashedPostStateCursorFactory, HashedStorageCursor}, proof::{Proof, StorageProof}, trie_cursor::{InMemoryTrieCursorFactory, TrieCursor, TrieCursorFactory}, AccountProof, BranchNodeCompact, HashedPostStateSorted, HashedStorage, MultiProof, MultiProofTargets, Nibbles, StorageMultiProof, TrieInput
 };
-use reth_trie_db::DatabaseHashedCursorFactory;
 
 pub struct ExternalTrieCursor<C>(pub(crate) C);
 
