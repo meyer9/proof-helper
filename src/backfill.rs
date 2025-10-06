@@ -11,7 +11,7 @@ use reth_db_api::{
     transaction::DbTx,
 };
 use reth_tracing::tracing::info;
-use reth_trie::{BranchNodeCompact, StorageTrieEntry, StoredNibbles, StoredNibblesSubKey};
+use reth_trie::{BranchNodeCompact, Nibbles, StorageTrieEntry, StoredNibbles, StoredNibblesSubKey};
 
 use crate::storage::{BranchNodeEntry, ExternalStateStore, TrieBranchesBatch};
 
@@ -115,7 +115,11 @@ impl CompletionEstimatable for B256 {
 impl CompletionEstimatable for StoredNibbles {
     fn estimate_progress(&self) -> f64 {
         // use the first 6 nibbles as a progress estimate
-        let progress_nibbles = self.0.slice(0..6);
+        let progress_nibbles = if self.0.len() > 0 {
+            self.0.slice(0..(self.0.len().min(6)))
+        } else {
+            Nibbles::new()
+        };
         let mut val: u64 = 0;
         for nibble in progress_nibbles.iter() {
             val = (val << 4) | nibble as u64;

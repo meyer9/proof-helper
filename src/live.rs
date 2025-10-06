@@ -11,7 +11,6 @@ use reth::{
     primitives::{RecoveredBlock, StorageEntry},
     providers::{DatabaseProviderFactory, StateProviderFactory, StateReader, StateRootProvider},
     revm::database::StateProviderDatabase,
-    rpc::types::BlockId,
 };
 use reth_evm::{ConfigureEvm, execute::Executor};
 use reth_trie::{
@@ -202,7 +201,7 @@ where
         block: &RecoveredBlock<<<Node::Types as NodeTypes>::Primitives as NodePrimitives>::Block>,
     ) -> eyre::Result<()> {
         // ensure that we have the state of the parent block
-        let (Some((earliest, _)), latest) = (
+        let (Some((earliest, _)), Some(latest)) = (
             self.storage.get_earliest_block_number().await?,
             self.storage.get_latest_block_number().await?,
         ) else {

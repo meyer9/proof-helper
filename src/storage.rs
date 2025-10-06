@@ -137,7 +137,7 @@ pub trait ExternalStateStore: Send + Sync + Debug {
     async fn get_earliest_block_number(&self) -> ExternalStorageResult<Option<(u64, B256)>>;
 
     /// Get the latest block number that has been stored
-    async fn get_latest_block_number(&self) -> ExternalStorageResult<u64>;
+    async fn get_latest_block_number(&self) -> ExternalStorageResult<Option<u64>>;
 
     /// Set the earliest block number and hash that has been stored
     async fn set_earliest_block_number(

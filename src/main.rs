@@ -82,7 +82,9 @@ where
         // TODO: we should disallow processing blocks until the backfill job is complete
 
         // check if we can process up to the latest block
-        let latest_stored_block_number = self.storage.get_latest_block_number().await?;
+        let Some(latest_stored_block_number) = self.storage.get_latest_block_number().await? else {
+            return Err(eyre::eyre!("No blocks stored"));
+        };
         let ChainInfo {
             best_number: latest_block_number,
             ..
@@ -113,7 +115,12 @@ where
         while let Some(notification) = self.ctx.notifications.try_next().await? {
             match &notification {
                 ExExNotification::ChainCommitted { new } => {
-                    let latest_stored_block_number = self.storage.get_latest_block_number().await?;
+                    let Some(latest_stored_block_number) =
+                        self.storage.get_latest_block_number().await?
+                    else {
+                        // db deleted?
+                        return Err(eyre::eyre!("No blocks stored"));
+                    };
                     if new.tip().number() <= latest_stored_block_number {
                         continue;
                     }

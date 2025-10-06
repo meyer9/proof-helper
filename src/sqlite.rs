@@ -695,21 +695,25 @@ impl ExternalStateStore for SqlitePreimageStore {
     type StorageCursor = SqlitePreimageStoreStorageCursor;
     type AccountHashedCursor = SqlitePreimageStoreAccountCursor;
 
-    async fn get_latest_block_number(&self) -> ExternalStorageResult<u64> {
+    async fn get_latest_block_number(&self) -> ExternalStorageResult<Option<u64>> {
+        let earliest_block_number = self.get_earliest_block_number().await?.map(|(bn, _)| bn);
+
+        let Some(earliest_block_number) = earliest_block_number else {
+            return Ok(None);
+        };
+
         let result = self
             .connect()?
             .query_row("SELECT MAX(block_number) FROM branch_nodes", [], |r| {
-                r.get::<_, u64>(0)
+                r.get::<_, Option<u64>>(0)
             })
             .map_err(Into::<ExternalStorageError>::into)?;
 
-        let earliest_block_number = self
-            .get_earliest_block_number()
-            .await?
-            .map(|(bn, _)| bn)
-            .unwrap_or(0);
-
-        Ok(result.max(earliest_block_number))
+        Ok(Some(
+            result
+                .map(|bn| earliest_block_number.max(bn))
+                .unwrap_or(earliest_block_number),
+        ))
     }
 
     fn get_last_storage_leaf(&self) -> ExternalStorageResult<Option<(B256, B256)>> {

@@ -1,12 +1,19 @@
 use async_trait::async_trait;
-use jsonrpsee::{
-    proc_macros::rpc,
-};
+use jsonrpsee::proc_macros::rpc;
 use jsonrpsee_core::RpcResult;
-use reth::{providers::{BlockIdReader, DatabaseProviderFactory, ProviderError, ProviderResult, StateProviderBox}, revm::{primitives::{Address}}, rpc::{api::eth::helpers::FullEthApi, server_types::eth::EthApiError, types::{serde_helpers::JsonStorageKey, BlockId, EIP1186AccountProofResponse}}};
+use reth::{
+    providers::{
+        BlockIdReader, DatabaseProviderFactory, ProviderError, ProviderResult, StateProviderBox,
+    },
+    revm::primitives::Address,
+    rpc::{
+        api::eth::helpers::FullEthApi,
+        server_types::eth::EthApiError,
+        types::{BlockId, EIP1186AccountProofResponse, serde_helpers::JsonStorageKey},
+    },
+};
 
-
-use crate::{storage::ExternalStateStore, provider::ExternalOverlayStateProviderRef};
+use crate::{provider::ExternalOverlayStateProviderRef, storage::ExternalStateStore};
 
 #[cfg_attr(not(test), rpc(server, namespace = "eth"))]
 #[cfg_attr(test, rpc(server, client, namespace = "eth"))]
@@ -22,7 +29,6 @@ pub trait EthApiOverride {
     ) -> RpcResult<EIP1186AccountProofResponse>;
 }
 
-
 // #[cfg_attr(not(test), rpc(server, namespace = "debug"))]
 // #[cfg_attr(test, rpc(server, client, namespace = "debug"))]
 // pub trait DebugApiOverride<Attributes> {
@@ -33,13 +39,10 @@ pub trait EthApiOverride {
 //         attributes: Attributes,
 //     ) -> RpcResult<ExecutionWitness>;
 
-
 //     #[method(name = "executionWitness")]
 //     async fn execution_witness(&self, block: BlockNumberOrTag)
 //         -> RpcResult<ExecutionWitness>;
 // }
-
-
 
 #[derive(Debug)]
 pub struct EthApiExt<Eth, P, Provider> {
@@ -55,19 +58,47 @@ where
     P: ExternalStateStore + Clone + 'static,
     Provider: DatabaseProviderFactory + 'static,
     Provider::Provider: Send + Sync + 'static,
- {
+{
     async fn state_provider(&self, block_id: Option<BlockId>) -> ProviderResult<StateProviderBox> {
         let block_id = block_id.unwrap_or_default();
         // Check whether the distance to the block exceeds the maximum configured window.
-        let block_number = self.eth_api.provider()
+        let block_number = self
+            .eth_api
+            .provider()
             .block_number_for_id(block_id)?
             .ok_or(EthApiError::HeaderNotFound(block_id))
             .map_err(|e| ProviderError::other(e))?;
 
-        let historical_provider = self.eth_api.state_at_block_id(block_id)
+        let historical_provider = self
+            .eth_api
+            .state_at_block_id(block_id)
             .await
             .map_err(|e| ProviderError::other(e))?;
-        let external_overlay_provider = ExternalOverlayStateProviderRef::new(historical_provider, self.preimage_store.clone(), self.provider.database_provider_ro()?, block_number);
+
+        let (Some(latest_block_number), Some((earliest_block_number, _))) = (
+            self.preimage_store
+                .get_latest_block_number()
+                .await
+                .map_err(|e| ProviderError::other(e))?,
+            self.preimage_store
+                .get_earliest_block_number()
+                .await
+                .map_err(|e| ProviderError::other(e))?,
+        ) else {
+            // if no earliest block, db is empty - use historical provider
+            return Ok(historical_provider);
+        };
+
+        if block_number < earliest_block_number || block_number > latest_block_number {
+            return Ok(historical_provider);
+        }
+
+        let external_overlay_provider = ExternalOverlayStateProviderRef::new(
+            historical_provider,
+            self.preimage_store.clone(),
+            self.provider.database_provider_ro()?,
+            block_number,
+        );
 
         Ok(Box::new(external_overlay_provider))
     }
@@ -92,7 +123,6 @@ where
     Provider: DatabaseProviderFactory + 'static,
     Provider::Provider: Send + Sync + 'static,
 {
-
     async fn get_proof(
         &self,
         address: Address,
@@ -100,7 +130,8 @@ where
         block_number: Option<BlockId>,
     ) -> RpcResult<EIP1186AccountProofResponse> {
         // TODO:
-        let state = self.state_provider(block_number)
+        let state = self
+            .state_provider(block_number)
             .await
             .map_err(Into::into)?;
         let storage_keys = keys.iter().map(|key| key.as_b256()).collect::<Vec<_>>();
@@ -109,6 +140,6 @@ where
             .proof(Default::default(), address, &storage_keys)
             .map_err(Into::into)?;
 
-        return Ok(proof.into_eip1186_response(keys))
+        return Ok(proof.into_eip1186_response(keys));
     }
 }
