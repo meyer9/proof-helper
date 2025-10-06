@@ -3,11 +3,7 @@
 use std::time::{Duration, Instant};
 
 use alloy_primitives::B256;
-use reth::{
-    chainspec::ChainInfo,
-    primitives::{Account, StorageEntry},
-    providers::{DBProvider, DatabaseProviderFactory, StateProviderFactory},
-};
+use reth::primitives::{Account, StorageEntry};
 use reth_db_api::{
     DatabaseError,
     cursor::{DbCursorRO, DbDupCursorRO},
@@ -19,9 +15,9 @@ use reth_trie::{BranchNodeCompact, StorageTrieEntry, StoredNibbles, StoredNibble
 
 use crate::storage::{BranchNodeEntry, ExternalStateStore, TrieBranchesBatch};
 
-pub struct BackfillJob<P, S> {
+pub struct BackfillJob<'a, Tx: DbTx, S: ExternalStateStore + Send> {
     storage: S,
-    provider: P,
+    tx: &'a Tx,
 }
 
 /// Macro to generate simple cursor iterators for tables
@@ -189,11 +185,9 @@ async fn backfill<
     Ok(total_entries)
 }
 
-impl<P: StateProviderFactory + DatabaseProviderFactory + Send, S: ExternalStateStore + Send>
-    BackfillJob<P, S>
-{
-    pub fn new(storage: S, provider: P) -> Self {
-        Self { storage, provider }
+impl<'a, Tx: DbTx, S: ExternalStateStore + Send> BackfillJob<'a, Tx, S> {
+    pub fn new(storage: S, tx: &'a Tx) -> Self {
+        Self { storage, tx }
     }
 
     /// Backfill all leaf nodes (accounts and storage)
@@ -205,11 +199,7 @@ impl<P: StateProviderFactory + DatabaseProviderFactory + Send, S: ExternalStateS
 
     /// Backfill hashed accounts data
     async fn backfill_hashed_accounts(&self) -> eyre::Result<()> {
-        let mut start_cursor = self
-            .provider
-            .database_provider_ro()?
-            .tx_ref()
-            .cursor_read::<tables::HashedAccounts>()?;
+        let mut start_cursor = self.tx.cursor_read::<tables::HashedAccounts>()?;
 
         let last_account_leaf = self.storage.get_last_account_leaf()?;
         if let Some(last_account_leaf) = last_account_leaf {
@@ -246,11 +236,7 @@ impl<P: StateProviderFactory + DatabaseProviderFactory + Send, S: ExternalStateS
 
     /// Backfill hashed storage data
     async fn backfill_hashed_storage(&self) -> eyre::Result<()> {
-        let mut start_cursor = self
-            .provider
-            .database_provider_ro()?
-            .tx_ref()
-            .cursor_dup_read::<tables::HashedStorages>()?;
+        let mut start_cursor = self.tx.cursor_dup_read::<tables::HashedStorages>()?;
 
         let last_storage_leaf = self.storage.get_last_storage_leaf()?;
         if let Some((hashed_address, storage_key)) = last_storage_leaf {
@@ -280,11 +266,7 @@ impl<P: StateProviderFactory + DatabaseProviderFactory + Send, S: ExternalStateS
 
     /// Backfill accounts trie data
     async fn backfill_accounts_trie(&self) -> eyre::Result<()> {
-        let mut start_cursor = self
-            .provider
-            .database_provider_ro()?
-            .tx_ref()
-            .cursor_read::<tables::AccountsTrie>()?;
+        let mut start_cursor = self.tx.cursor_read::<tables::AccountsTrie>()?;
 
         let last_account_branch = self.storage.get_last_account_branch()?;
         if let Some(last_account_branch) = last_account_branch {
@@ -325,11 +307,7 @@ impl<P: StateProviderFactory + DatabaseProviderFactory + Send, S: ExternalStateS
 
     /// Backfill storage trie data
     pub async fn backfill_storages_trie(&self) -> eyre::Result<()> {
-        let mut start_cursor = self
-            .provider
-            .database_provider_ro()?
-            .tx_ref()
-            .cursor_dup_read::<tables::StoragesTrie>()?;
+        let mut start_cursor = self.tx.cursor_dup_read::<tables::StoragesTrie>()?;
 
         let last_storage_branch = self.storage.get_last_storage_branch()?;
         if let Some((hashed_address, nibbles)) = last_storage_branch {
@@ -378,14 +356,10 @@ impl<P: StateProviderFactory + DatabaseProviderFactory + Send, S: ExternalStateS
         Ok(())
     }
 
-    pub async fn run(&self) -> eyre::Result<()> {
+    pub async fn run(&self, best_number: u64, best_hash: B256) -> eyre::Result<()> {
         if self.storage.get_earliest_block_number().await? == None {
             self.backfill_trie().await?;
 
-            let ChainInfo {
-                best_number,
-                best_hash,
-            } = self.provider.chain_info().unwrap();
             self.storage
                 .set_earliest_block_number(best_number, best_hash)
                 .await?;
