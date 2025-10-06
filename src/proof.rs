@@ -1,10 +1,24 @@
-use crate::storage::{ExternalHashedCursor, ExternalStateStore, ExternalTrieCursor as ExternalDBTrieCursor};
-use alloy_primitives::{keccak256, map::HashMap, Address, B256, U256};
+use crate::storage::{
+    ExternalHashedCursor, ExternalStateStore, ExternalTrieCursor as ExternalDBTrieCursor,
+};
+use alloy_primitives::{
+    Address, B256, Bytes, U256, keccak256,
+    map::{B256Map, HashMap},
+};
 use reth::primitives::Account;
-use reth_db_api::{DatabaseError};
-use reth_execution_errors::StateProofError;
+use reth_db_api::DatabaseError;
+use reth_execution_errors::{StateProofError, StateRootError, StorageRootError, TrieWitnessError};
 use reth_trie::{
-    hashed_cursor::{HashedCursor, HashedCursorFactory, HashedPostStateCursorFactory, HashedStorageCursor}, proof::{Proof, StorageProof}, trie_cursor::{InMemoryTrieCursorFactory, TrieCursor, TrieCursorFactory}, AccountProof, BranchNodeCompact, HashedPostStateSorted, HashedStorage, MultiProof, MultiProofTargets, Nibbles, StorageMultiProof, TrieInput
+    AccountProof, BranchNodeCompact, HashedPostState, HashedPostStateSorted, HashedStorage,
+    MultiProof, MultiProofTargets, Nibbles, StateRoot, StorageMultiProof, StorageRoot, TrieInput,
+    hashed_cursor::{
+        HashedCursor, HashedCursorFactory, HashedPostStateCursorFactory, HashedStorageCursor,
+    },
+    metrics::TrieRootMetrics,
+    proof::{Proof, StorageProof},
+    trie_cursor::{InMemoryTrieCursorFactory, TrieCursor, TrieCursorFactory},
+    updates::TrieUpdates,
+    witness::TrieWitness,
 };
 
 pub struct ExternalTrieCursor<C>(pub(crate) C);
@@ -16,25 +30,26 @@ impl<C> ExternalTrieCursor<C> {
 }
 
 impl<C: ExternalDBTrieCursor + Send + Sync> TrieCursor for ExternalTrieCursor<C> {
-    fn seek_exact(&mut self, key: Nibbles) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError> {
-        self.0.seek_exact(key)
-            .map_err(Into::into)
+    fn seek_exact(
+        &mut self,
+        key: Nibbles,
+    ) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError> {
+        self.0.seek_exact(key).map_err(Into::into)
     }
-    
-    
-    fn seek(&mut self, key: Nibbles) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError> {
-        self.0.seek(key)
-            .map_err(Into::into)
+
+    fn seek(
+        &mut self,
+        key: Nibbles,
+    ) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError> {
+        self.0.seek(key).map_err(Into::into)
     }
 
     fn next(&mut self) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError> {
-        self.0.next()
-            .map_err(Into::into)
+        self.0.next().map_err(Into::into)
     }
 
     fn current(&mut self) -> Result<Option<Nibbles>, DatabaseError> {
-        self.0.current()
-            .map_err(Into::into)
+        self.0.current().map_err(Into::into)
     }
 }
 
@@ -46,7 +61,10 @@ pub struct ExternalTrieCursorFactory<P> {
 
 impl<P> ExternalTrieCursorFactory<P> {
     pub fn new(preimage_store: P, block_number: u64) -> Self {
-        Self { preimage_store, block_number }
+        Self {
+            preimage_store,
+            block_number,
+        }
     }
 }
 
@@ -55,11 +73,22 @@ impl<P: ExternalStateStore> TrieCursorFactory for ExternalTrieCursorFactory<P> {
     type StorageTrieCursor = ExternalTrieCursor<P::TrieCursor>;
 
     fn account_trie_cursor(&self) -> Result<Self::AccountTrieCursor, DatabaseError> {
-        Ok(ExternalTrieCursor::new(self.preimage_store.trie_cursor(None, self.block_number).map_err(Into::<DatabaseError>::into)?))
+        Ok(ExternalTrieCursor::new(
+            self.preimage_store
+                .trie_cursor(None, self.block_number)
+                .map_err(Into::<DatabaseError>::into)?,
+        ))
     }
-    
-    fn storage_trie_cursor(&self, hashed_address: B256) -> Result<Self::StorageTrieCursor, DatabaseError> {
-        Ok(ExternalTrieCursor::new(self.preimage_store.trie_cursor(Some(hashed_address), self.block_number).map_err(Into::<DatabaseError>::into)?))
+
+    fn storage_trie_cursor(
+        &self,
+        hashed_address: B256,
+    ) -> Result<Self::StorageTrieCursor, DatabaseError> {
+        Ok(ExternalTrieCursor::new(
+            self.preimage_store
+                .trie_cursor(Some(hashed_address), self.block_number)
+                .map_err(Into::<DatabaseError>::into)?,
+        ))
     }
 }
 
@@ -72,17 +101,17 @@ impl<C> ExternalHashedAccountCursor<C> {
     }
 }
 
-impl<C: ExternalHashedCursor<Value = Account> + Send + Sync> HashedCursor for ExternalHashedAccountCursor<C> {
+impl<C: ExternalHashedCursor<Value = Account> + Send + Sync> HashedCursor
+    for ExternalHashedAccountCursor<C>
+{
     type Value = Account;
 
     fn seek(&mut self, key: B256) -> Result<Option<(B256, Self::Value)>, DatabaseError> {
-        self.0.seek(key)
-            .map_err(Into::into)
+        self.0.seek(key).map_err(Into::into)
     }
 
     fn next(&mut self) -> Result<Option<(B256, Self::Value)>, DatabaseError> {
-        self.0.next()
-            .map_err(Into::into)
+        self.0.next().map_err(Into::into)
     }
 }
 
@@ -95,24 +124,25 @@ impl<C> ExternalHashedStorageCursor<C> {
     }
 }
 
-impl<C: ExternalHashedCursor<Value = U256> + Send + Sync> HashedCursor for ExternalHashedStorageCursor<C> {
+impl<C: ExternalHashedCursor<Value = U256> + Send + Sync> HashedCursor
+    for ExternalHashedStorageCursor<C>
+{
     type Value = U256;
 
     fn seek(&mut self, key: B256) -> Result<Option<(B256, Self::Value)>, DatabaseError> {
-        self.0.seek(key)
-            .map_err(Into::into)
+        self.0.seek(key).map_err(Into::into)
     }
 
     fn next(&mut self) -> Result<Option<(B256, Self::Value)>, DatabaseError> {
-        self.0.next()
-            .map_err(Into::into)
+        self.0.next().map_err(Into::into)
     }
 }
 
-impl<C: ExternalHashedCursor<Value = U256> + Send + Sync> HashedStorageCursor for ExternalHashedStorageCursor<C> {
+impl<C: ExternalHashedCursor<Value = U256> + Send + Sync> HashedStorageCursor
+    for ExternalHashedStorageCursor<C>
+{
     fn is_storage_empty(&mut self) -> Result<bool, DatabaseError> {
-        self.0.is_storage_empty()
-            .map_err(Into::into)
+        self.0.is_storage_empty().map_err(Into::into)
     }
 }
 
@@ -124,20 +154,34 @@ pub struct ExternalHashedAccountCursorFactory<P> {
 
 impl<P> ExternalHashedAccountCursorFactory<P> {
     pub fn new(preimage_store: P, block_number: u64) -> Self {
-        Self { preimage_store, block_number }
+        Self {
+            preimage_store,
+            block_number,
+        }
     }
 }
 
 impl<P: ExternalStateStore> HashedCursorFactory for ExternalHashedAccountCursorFactory<P> {
     type AccountCursor = ExternalHashedAccountCursor<P::AccountHashedCursor>;
     type StorageCursor = ExternalHashedStorageCursor<P::StorageCursor>;
-    
+
     fn hashed_account_cursor(&self) -> Result<Self::AccountCursor, DatabaseError> {
-        Ok(ExternalHashedAccountCursor::new(self.preimage_store.account_hashed_cursor(self.block_number).map_err(Into::<DatabaseError>::into)?))
+        Ok(ExternalHashedAccountCursor::new(
+            self.preimage_store
+                .account_hashed_cursor(self.block_number)
+                .map_err(Into::<DatabaseError>::into)?,
+        ))
     }
 
-    fn hashed_storage_cursor(&self, hashed_address: B256) -> Result<Self::StorageCursor, DatabaseError> {
-        Ok(ExternalHashedStorageCursor::new(self.preimage_store.storage_hashed_cursor(hashed_address, self.block_number).map_err(Into::<DatabaseError>::into)?))
+    fn hashed_storage_cursor(
+        &self,
+        hashed_address: B256,
+    ) -> Result<Self::StorageCursor, DatabaseError> {
+        Ok(ExternalHashedStorageCursor::new(
+            self.preimage_store
+                .storage_hashed_cursor(hashed_address, self.block_number)
+                .map_err(Into::<DatabaseError>::into)?,
+        ))
     }
 }
 
@@ -168,7 +212,10 @@ impl<P: ExternalStateStore + Clone> DatabaseProof<P>
 {
     /// Create a new [Proof] instance from database transaction.
     fn from_tx(preimage_store: P, block_number: u64) -> Self {
-        Self::new(ExternalTrieCursorFactory::new(preimage_store.clone(), block_number), ExternalHashedAccountCursorFactory::new(preimage_store, block_number))
+        Self::new(
+            ExternalTrieCursorFactory::new(preimage_store.clone(), block_number),
+            ExternalHashedAccountCursorFactory::new(preimage_store, block_number),
+        )
     }
 
     fn overlay_account_proof(
@@ -243,7 +290,11 @@ impl<P: ExternalStateStore + Clone> DatabaseStorageProof<P>
     for StorageProof<ExternalTrieCursorFactory<P>, ExternalHashedAccountCursorFactory<P>>
 {
     fn from_tx(preimage_store: P, block_number: u64, address: Address) -> Self {
-        Self::new(ExternalTrieCursorFactory::new(preimage_store.clone(), block_number), ExternalHashedAccountCursorFactory::new(preimage_store, block_number), address)
+        Self::new(
+            ExternalTrieCursorFactory::new(preimage_store.clone(), block_number),
+            ExternalHashedAccountCursorFactory::new(preimage_store, block_number),
+            address,
+        )
     }
 
     fn overlay_storage_proof(
@@ -289,5 +340,205 @@ impl<P: ExternalStateStore + Clone> DatabaseStorageProof<P>
             ))
             .with_prefix_set_mut(prefix_set)
             .storage_multiproof(targets)
+    }
+}
+
+pub trait DatabaseStateRoot<P>: Sized {
+    /// Calculate the state root for this [`HashedPostState`].
+    /// Internally, this method retrieves prefixsets and uses them
+    /// to calculate incremental state root.
+    ///
+    /// # Returns
+    ///
+    /// The state root for this [`HashedPostState`].
+    fn overlay_root(
+        preimage_store: P,
+        block_number: u64,
+        post_state: HashedPostState,
+    ) -> Result<B256, StateRootError>;
+
+    /// Calculates the state root for this [`HashedPostState`] and returns it alongside trie
+    /// updates. See [`Self::overlay_root`] for more info.
+    fn overlay_root_with_updates(
+        preimage_store: P,
+        block_number: u64,
+        post_state: HashedPostState,
+    ) -> Result<(B256, TrieUpdates), StateRootError>;
+
+    /// Calculates the state root for provided [`HashedPostState`] using cached intermediate nodes.
+    fn overlay_root_from_nodes(
+        preimage_store: P,
+        block_number: u64,
+        input: TrieInput,
+    ) -> Result<B256, StateRootError>;
+
+    /// Calculates the state root and trie updates for provided [`HashedPostState`] using
+    /// cached intermediate nodes.
+    fn overlay_root_from_nodes_with_updates(
+        preimage_store: P,
+        block_number: u64,
+        input: TrieInput,
+    ) -> Result<(B256, TrieUpdates), StateRootError>;
+}
+
+impl<P: ExternalStateStore + Clone> DatabaseStateRoot<P>
+    for StateRoot<ExternalTrieCursorFactory<P>, ExternalHashedAccountCursorFactory<P>>
+{
+    fn overlay_root(
+        preimage_store: P,
+        block_number: u64,
+        post_state: HashedPostState,
+    ) -> Result<B256, StateRootError> {
+        let prefix_sets = post_state.construct_prefix_sets().freeze();
+        let state_sorted = post_state.into_sorted();
+        StateRoot::new(
+            ExternalTrieCursorFactory::new(preimage_store.clone(), block_number),
+            HashedPostStateCursorFactory::new(
+                ExternalHashedAccountCursorFactory::new(preimage_store, block_number),
+                &state_sorted,
+            ),
+        )
+        .with_prefix_sets(prefix_sets)
+        .root()
+    }
+
+    fn overlay_root_with_updates(
+        preimage_store: P,
+        block_number: u64,
+        post_state: HashedPostState,
+    ) -> Result<(B256, TrieUpdates), StateRootError> {
+        let prefix_sets = post_state.construct_prefix_sets().freeze();
+        let state_sorted = post_state.into_sorted();
+        StateRoot::new(
+            ExternalTrieCursorFactory::new(preimage_store.clone(), block_number),
+            HashedPostStateCursorFactory::new(
+                ExternalHashedAccountCursorFactory::new(preimage_store, block_number),
+                &state_sorted,
+            ),
+        )
+        .with_prefix_sets(prefix_sets)
+        .root_with_updates()
+    }
+
+    fn overlay_root_from_nodes(
+        preimage_store: P,
+        block_number: u64,
+        input: TrieInput,
+    ) -> Result<B256, StateRootError> {
+        let state_sorted = input.state.into_sorted();
+        let nodes_sorted = input.nodes.into_sorted();
+        StateRoot::new(
+            InMemoryTrieCursorFactory::new(
+                ExternalTrieCursorFactory::new(preimage_store.clone(), block_number),
+                &nodes_sorted,
+            ),
+            HashedPostStateCursorFactory::new(
+                ExternalHashedAccountCursorFactory::new(preimage_store, block_number),
+                &state_sorted,
+            ),
+        )
+        .with_prefix_sets(input.prefix_sets.freeze())
+        .root()
+    }
+
+    fn overlay_root_from_nodes_with_updates(
+        preimage_store: P,
+        block_number: u64,
+        input: TrieInput,
+    ) -> Result<(B256, TrieUpdates), StateRootError> {
+        let state_sorted = input.state.into_sorted();
+        let nodes_sorted = input.nodes.into_sorted();
+        StateRoot::new(
+            InMemoryTrieCursorFactory::new(
+                ExternalTrieCursorFactory::new(preimage_store.clone(), block_number),
+                &nodes_sorted,
+            ),
+            HashedPostStateCursorFactory::new(
+                ExternalHashedAccountCursorFactory::new(preimage_store, block_number),
+                &state_sorted,
+            ),
+        )
+        .with_prefix_sets(input.prefix_sets.freeze())
+        .root_with_updates()
+    }
+}
+
+pub trait DatabaseStorageRoot<P> {
+    fn overlay_root(
+        preimage_store: P,
+        block_number: u64,
+        address: Address,
+        hashed_storage: HashedStorage,
+    ) -> Result<B256, StorageRootError>;
+}
+
+impl<P: ExternalStateStore + Clone> DatabaseStorageRoot<P>
+    for StorageRoot<ExternalTrieCursorFactory<P>, ExternalHashedAccountCursorFactory<P>>
+{
+    fn overlay_root(
+        preimage_store: P,
+        block_number: u64,
+        address: Address,
+        hashed_storage: HashedStorage,
+    ) -> Result<B256, StorageRootError> {
+        let prefix_set = hashed_storage.construct_prefix_set().freeze();
+        let state_sorted =
+            HashedPostState::from_hashed_storage(keccak256(address), hashed_storage).into_sorted();
+        StorageRoot::new(
+            ExternalTrieCursorFactory::new(preimage_store.clone(), block_number),
+            HashedPostStateCursorFactory::new(
+                ExternalHashedAccountCursorFactory::new(preimage_store, block_number),
+                &state_sorted,
+            ),
+            address,
+            prefix_set,
+            // #[cfg(feature = "metrics")]
+            TrieRootMetrics::new(reth_trie::TrieType::Storage),
+        )
+        .root()
+    }
+}
+
+pub trait DatabaseTrieWitness<P> {
+    fn from_tx(preimage_store: P, block_number: u64) -> Self;
+
+    fn overlay_witness(
+        preimage_store: P,
+        block_number: u64,
+        input: TrieInput,
+        target: HashedPostState,
+    ) -> Result<B256Map<Bytes>, TrieWitnessError>;
+}
+
+impl<P: ExternalStateStore + Clone> DatabaseTrieWitness<P>
+    for TrieWitness<ExternalTrieCursorFactory<P>, ExternalHashedAccountCursorFactory<P>>
+{
+    fn from_tx(preimage_store: P, block_number: u64) -> Self {
+        Self::new(
+            ExternalTrieCursorFactory::new(preimage_store.clone(), block_number),
+            ExternalHashedAccountCursorFactory::new(preimage_store, block_number),
+        )
+    }
+
+    fn overlay_witness(
+        preimage_store: P,
+        block_number: u64,
+        input: TrieInput,
+        target: HashedPostState,
+    ) -> Result<B256Map<Bytes>, TrieWitnessError> {
+        let nodes_sorted = input.nodes.into_sorted();
+        let state_sorted = input.state.into_sorted();
+        Self::from_tx(preimage_store.clone(), block_number)
+            .with_trie_cursor_factory(InMemoryTrieCursorFactory::new(
+                ExternalTrieCursorFactory::new(preimage_store.clone(), block_number),
+                &nodes_sorted,
+            ))
+            .with_hashed_cursor_factory(HashedPostStateCursorFactory::new(
+                ExternalHashedAccountCursorFactory::new(preimage_store, block_number),
+                &state_sorted,
+            ))
+            .with_prefix_sets_mut(input.prefix_sets)
+            .always_include_root_node()
+            .compute(target)
     }
 }

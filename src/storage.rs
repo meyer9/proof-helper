@@ -3,7 +3,7 @@ use auto_impl::auto_impl;
 use reth::primitives::Account;
 use reth::{primitives::StorageEntry, revm::primitives::B256};
 use reth_db_api::DatabaseError;
-use reth_trie::{BranchNodeCompact, Nibbles, StorageTrieEntry};
+use reth_trie::{BranchNodeCompact, Nibbles};
 use std::fmt::Debug;
 
 /// Error types for preimage storage operations
@@ -137,7 +137,7 @@ pub trait ExternalStateStore: Send + Sync + Debug {
     async fn get_earliest_block_number(&self) -> ExternalStorageResult<Option<(u64, B256)>>;
 
     /// Get the latest block number that has been stored
-    fn get_latest_block_number(&self) -> ExternalStorageResult<u64>;
+    async fn get_latest_block_number(&self) -> ExternalStorageResult<u64>;
 
     /// Set the earliest block number and hash that has been stored
     async fn set_earliest_block_number(

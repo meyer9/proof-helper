@@ -1,16 +1,38 @@
-use reth::{primitives::{Account, Bytecode}, providers::{AccountReader, BlockHashReader, BytecodeReader, DBProvider, HashedPostStateProvider, ProviderError, ProviderResult, StateProofProvider, StateRootProvider, StorageRootProvider}, revm::{db::BundleState, primitives::{alloy_primitives::BlockNumber, Address, Bytes, StorageValue, B256}}};
+use alloy_primitives::keccak256;
 use reth::providers::StateProvider;
-use reth_trie::{proof::Proof, updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage, MultiProof, MultiProofTargets, StorageMultiProof, TrieInput};
+use reth::{
+    primitives::{Account, Bytecode},
+    providers::{
+        AccountReader, BlockHashReader, BytecodeReader, DBProvider, HashedPostStateProvider,
+        ProviderError, ProviderResult, StateProofProvider, StateRootProvider, StorageRootProvider,
+    },
+    revm::{
+        db::BundleState,
+        primitives::{Address, B256, Bytes, StorageValue, alloy_primitives::BlockNumber},
+    },
+};
+use reth_db_api::tables;
+use reth_db_api::transaction::DbTx;
+use reth_trie::KeccakKeyHasher;
+use reth_trie::witness::TrieWitness;
+use reth_trie::{
+    AccountProof, HashedPostState, HashedStorage, MultiProof, MultiProofTargets, StorageMultiProof,
+    TrieInput, proof::Proof, updates::TrieUpdates,
+};
+use reth_trie::{StateRoot, StorageRoot, proof::StorageProof};
 
-use crate::{proof::DatabaseProof, storage::ExternalStateStore};
+use crate::storage::{ExternalHashedCursor, ExternalStorageError};
+use crate::{
+    proof::{
+        DatabaseProof, DatabaseStateRoot, DatabaseStorageProof, DatabaseStorageRoot,
+        DatabaseTrieWitness,
+    },
+    storage::ExternalStateStore,
+};
 
-pub struct ExternalOverlayStateProviderRef<
-    'a,
-    P: ExternalStateStore,
-    Provider: DBProvider,
-> {
+pub struct ExternalOverlayStateProviderRef<'a, P: ExternalStateStore, Provider: DBProvider> {
     /// Historical state provider for non-trie related tasks.
-    pub(crate) historical: Box<dyn StateProvider + 'a>,
+    pub(crate) latest: Box<dyn StateProvider + 'a>,
 
     pub(crate) provider: Provider,
 
@@ -26,10 +48,17 @@ impl<P: ExternalStateStore, Provider: DBProvider> ExternalOverlayStateProviderRe
     }
 }
 
-impl<'a, P: ExternalStateStore, Provider: DBProvider> ExternalOverlayStateProviderRef<'a, P, Provider> {
-    pub fn new(historical: Box<dyn StateProvider + 'a>, storage: P, provider: Provider, block_number: BlockNumber) -> Self {
+impl<'a, P: ExternalStateStore, Provider: DBProvider>
+    ExternalOverlayStateProviderRef<'a, P, Provider>
+{
+    pub fn new(
+        latest: Box<dyn StateProvider + 'a>,
+        storage: P,
+        provider: Provider,
+        block_number: BlockNumber,
+    ) -> Self {
         Self {
-            historical,
+            latest,
             provider,
             storage,
             block_number,
@@ -37,10 +66,17 @@ impl<'a, P: ExternalStateStore, Provider: DBProvider> ExternalOverlayStateProvid
     }
 }
 
+impl Into<ProviderError> for ExternalStorageError {
+    fn into(self) -> ProviderError {
+        ProviderError::other(self)
+    }
+}
 
-impl<'a, P: ExternalStateStore, Provider: DBProvider + Send + Sync> BlockHashReader for ExternalOverlayStateProviderRef<'a, P, Provider> {
+impl<'a, P: ExternalStateStore, Provider: DBProvider + Send + Sync> BlockHashReader
+    for ExternalOverlayStateProviderRef<'a, P, Provider>
+{
     fn block_hash(&self, number: BlockNumber) -> ProviderResult<Option<B256>> {
-        self.historical.block_hash(number)
+        self.latest.block_hash(number)
     }
 
     fn canonical_hashes_range(
@@ -48,108 +84,192 @@ impl<'a, P: ExternalStateStore, Provider: DBProvider + Send + Sync> BlockHashRea
         start: BlockNumber,
         end: BlockNumber,
     ) -> ProviderResult<Vec<B256>> {
-        self.historical.canonical_hashes_range(start, end)
+        self.latest.canonical_hashes_range(start, end)
     }
 }
 
-impl<'a, P: ExternalStateStore, Provider: DBProvider> AccountReader for ExternalOverlayStateProviderRef<'a, P, Provider> {
-    fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
-        self.historical.basic_account(address)
-    }
-}
-
-impl<'a, P: ExternalStateStore, Provider: DBProvider + Send + Sync> StateRootProvider for ExternalOverlayStateProviderRef<'a, P, Provider> {
+impl<'a, P: ExternalStateStore + Clone, Provider: DBProvider + Send + Sync> StateRootProvider
+    for ExternalOverlayStateProviderRef<'a, P, Provider>
+{
+    #[tracing::instrument(skip(self, state))]
     fn state_root(&self, state: HashedPostState) -> ProviderResult<B256> {
-        self.state_root_from_nodes(TrieInput::from_state(state))
+        StateRoot::overlay_root(self.storage.clone(), self.block_number, state)
+            .map_err(|err| ProviderError::Database(err.into()))
     }
 
+    #[tracing::instrument(skip(self, input))]
     fn state_root_from_nodes(&self, input: TrieInput) -> ProviderResult<B256> {
-        self.historical.state_root_from_nodes(input)
+        StateRoot::overlay_root_from_nodes(self.storage.clone(), self.block_number, input)
+            .map_err(|err| ProviderError::Database(err.into()))
     }
 
+    #[tracing::instrument(skip(self, state))]
     fn state_root_with_updates(
         &self,
         state: HashedPostState,
     ) -> ProviderResult<(B256, TrieUpdates)> {
-        self.state_root_from_nodes_with_updates(TrieInput::from_state(state))
+        StateRoot::overlay_root_with_updates(self.storage.clone(), self.block_number, state)
+            .map_err(|err| ProviderError::Database(err.into()))
     }
 
+    #[tracing::instrument(skip(self, input))]
     fn state_root_from_nodes_with_updates(
         &self,
         input: TrieInput,
     ) -> ProviderResult<(B256, TrieUpdates)> {
-        self.historical.state_root_from_nodes_with_updates(input)
+        StateRoot::overlay_root_from_nodes_with_updates(
+            self.storage.clone(),
+            self.block_number,
+            input,
+        )
+        .map_err(|err| ProviderError::Database(err.into()))
     }
 }
 
-impl<'a, P: ExternalStateStore, Provider: DBProvider + Send + Sync> StorageRootProvider for ExternalOverlayStateProviderRef<'a, P, Provider> {
-    // TODO: Currently this does not reuse available in-memory trie nodes.
+impl<'a, P: ExternalStateStore + Clone, Provider: DBProvider + Send + Sync> StorageRootProvider
+    for ExternalOverlayStateProviderRef<'a, P, Provider>
+{
+    #[tracing::instrument(skip(self, storage), level = "info")]
     fn storage_root(&self, address: Address, storage: HashedStorage) -> ProviderResult<B256> {
-        self.historical.storage_root(address, storage)
+        StorageRoot::overlay_root(self.storage.clone(), self.block_number, address, storage)
+            .map_err(|err| ProviderError::Database(err.into()))
     }
 
-    // TODO: Currently this does not reuse available in-memory trie nodes.
+    #[tracing::instrument(skip(self, storage), level = "info")]
     fn storage_proof(
         &self,
         address: Address,
         slot: B256,
         storage: HashedStorage,
     ) -> ProviderResult<reth_trie::StorageProof> {
-        self.historical.storage_proof(address, slot, storage)
+        StorageProof::overlay_storage_proof(
+            self.storage.clone(),
+            self.block_number,
+            address,
+            slot,
+            storage,
+        )
+        .map_err(ProviderError::from)
     }
 
-    // TODO: Currently this does not reuse available in-memory trie nodes.
+    #[tracing::instrument(skip(self, storage), level = "info")]
     fn storage_multiproof(
         &self,
         address: Address,
         slots: &[B256],
         storage: HashedStorage,
     ) -> ProviderResult<StorageMultiProof> {
-        self.historical.storage_multiproof(address, slots, storage)
+        StorageProof::overlay_storage_multiproof(
+            self.storage.clone(),
+            self.block_number,
+            address,
+            slots,
+            storage,
+        )
+        .map_err(ProviderError::from)
     }
 }
 
-impl<'a, P: ExternalStateStore + Clone, Provider: DBProvider + Send + Sync> StateProofProvider for ExternalOverlayStateProviderRef<'a, P, Provider> {
+impl<'a, P: ExternalStateStore + Clone, Provider: DBProvider + Send + Sync> StateProofProvider
+    for ExternalOverlayStateProviderRef<'a, P, Provider>
+{
+    #[tracing::instrument(skip(self, input, slots), level = "info")]
     fn proof(
         &self,
         input: TrieInput,
         address: Address,
         slots: &[B256],
     ) -> ProviderResult<AccountProof> {
-        Proof::overlay_account_proof(self.storage.clone(), self.block_number, input, address, slots).map_err(ProviderError::from)
+        Proof::overlay_account_proof(
+            self.storage.clone(),
+            self.block_number,
+            input,
+            address,
+            slots,
+        )
+        .map_err(ProviderError::from)
     }
 
+    #[tracing::instrument(skip(self, input, targets), level = "info")]
     fn multiproof(
         &self,
         input: TrieInput,
         targets: MultiProofTargets,
     ) -> ProviderResult<MultiProof> {
-        self.historical.multiproof(input, targets)
+        Proof::overlay_multiproof(self.storage.clone(), self.block_number, input, targets)
+            .map_err(ProviderError::from)
     }
 
+    #[tracing::instrument(skip(self, input, target), level = "info")]
     fn witness(&self, input: TrieInput, target: HashedPostState) -> ProviderResult<Vec<Bytes>> {
-        self.historical.witness(input, target)
+        TrieWitness::overlay_witness(self.storage.clone(), self.block_number, input, target)
+            .map_err(ProviderError::from)
+            .map(|hm| hm.into_values().collect())
     }
 }
 
-impl<'a, P: ExternalStateStore, Provider: DBProvider + Send + Sync> HashedPostStateProvider for ExternalOverlayStateProviderRef<'a, P, Provider> {
+impl<'a, P: ExternalStateStore, Provider: DBProvider + Send + Sync> HashedPostStateProvider
+    for ExternalOverlayStateProviderRef<'a, P, Provider>
+{
+    #[tracing::instrument(skip(self, bundle_state), level = "info")]
     fn hashed_post_state(&self, bundle_state: &BundleState) -> HashedPostState {
-        self.historical.hashed_post_state(bundle_state)
+        HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle_state.state())
     }
 }
 
-impl<'a, P: ExternalStateStore + Clone, Provider: DBProvider + Send + Sync> StateProvider for ExternalOverlayStateProviderRef<'a, P, Provider> {
-    fn storage(
-        &self,
-        address: Address,
-        storage_key: B256,
-    ) -> ProviderResult<Option<StorageValue>> {
-        self.historical.storage(address, storage_key)
+impl<'a, P: ExternalStateStore, Provider: DBProvider> AccountReader
+    for ExternalOverlayStateProviderRef<'a, P, Provider>
+{
+    #[tracing::instrument(skip(self), level = "info")]
+    fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
+        let hashed_key = keccak256(&address.0);
+        Ok(self
+            .storage
+            .account_hashed_cursor(self.block_number)
+            .map_err(Into::<ProviderError>::into)?
+            .seek(hashed_key)
+            .map_err(Into::<ProviderError>::into)?
+            .map(|(key, account)| {
+                if key == hashed_key {
+                    Some(account)
+                } else {
+                    None
+                }
+            })
+            .flatten())
     }
 }
 
-impl<'a, P: ExternalStateStore, Provider: DBProvider + Send + Sync> BytecodeReader for ExternalOverlayStateProviderRef<'a, P, Provider> {
+impl<'a, P: ExternalStateStore + Clone, Provider: DBProvider + Send + Sync> StateProvider
+    for ExternalOverlayStateProviderRef<'a, P, Provider>
+{
+    #[tracing::instrument(skip(self), level = "info")]
+    fn storage(&self, address: Address, storage_key: B256) -> ProviderResult<Option<StorageValue>> {
+        let hashed_key = keccak256(storage_key);
+        Ok(self
+            .storage
+            .storage_hashed_cursor(keccak256(&address.0), self.block_number)
+            .map_err(Into::<ProviderError>::into)?
+            .seek(hashed_key)
+            .map_err(Into::<ProviderError>::into)?
+            .map(|(key, storage)| {
+                if key == hashed_key {
+                    Some(storage)
+                } else {
+                    None
+                }
+            })
+            .flatten())
+    }
+}
+
+impl<'a, P: ExternalStateStore, Provider: DBProvider + Send + Sync> BytecodeReader
+    for ExternalOverlayStateProviderRef<'a, P, Provider>
+{
+    #[tracing::instrument(skip(self), level = "info")]
     fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>> {
-        self.historical.bytecode_by_hash(code_hash)
+        self.tx()
+            .get_by_encoded_key::<tables::Bytecodes>(code_hash)
+            .map_err(Into::into)
     }
 }

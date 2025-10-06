@@ -1,5 +1,7 @@
 #![warn(clippy::future_not_send)]
 
+use std::time::{Duration, Instant};
+
 use alloy_primitives::B256;
 use reth::{
     chainspec::ChainInfo,
@@ -17,13 +19,7 @@ use reth_trie::{BranchNodeCompact, StorageTrieEntry, StoredNibbles, StoredNibble
 
 use crate::storage::{BranchNodeEntry, ExternalStateStore, TrieBranchesBatch};
 
-pub enum BackfillOperation {
-    SetTargetBlockNumber { target_block_number: u64 },
-}
-
 pub struct BackfillJob<P, S> {
-    // static for now, but eventually we will add pruning
-    target_block_number: Option<u64>,
     storage: S,
     provider: P,
 }
@@ -103,31 +99,78 @@ define_dup_cursor_iter!(
     StorageTrieEntry
 );
 
+trait CompletionEstimatable {
+    // Returns a progress estimate as a percentage (0.0 to 1.0)
+    fn estimate_progress(&self) -> f64;
+}
+
+impl CompletionEstimatable for B256 {
+    fn estimate_progress(&self) -> f64 {
+        // use the first 3 bytes as a progress estimate
+        let progress = self.0[..3].to_vec();
+        let mut val: u64 = 0;
+        for nibble in progress.iter() {
+            val = (val << 8) | *nibble as u64;
+        }
+        val as f64 / (256u64.pow(3)) as f64
+    }
+}
+
+impl CompletionEstimatable for StoredNibbles {
+    fn estimate_progress(&self) -> f64 {
+        // use the first 6 nibbles as a progress estimate
+        let progress_nibbles = self.0.slice(0..6);
+        let mut val: u64 = 0;
+        for nibble in progress_nibbles.iter() {
+            val = (val << 4) | nibble as u64;
+        }
+        val as f64 / (16u64.pow(progress_nibbles.len() as u32)) as f64
+    }
+}
+
 async fn backfill<
-    S: Iterator<Item = Result<Item, DatabaseError>>,
-    Item,
+    S: Iterator<Item = Result<(Key, Value), DatabaseError>>,
     F: Future<Output = eyre::Result<()>> + Send,
+    Key: CompletionEstimatable + Clone,
+    Value: Clone,
 >(
     name: &str,
     source: S,
     storage_threshold: usize,
     log_threshold: usize,
-    save_fn: impl Fn(Vec<Item>) -> F,
+    save_fn: impl Fn(Vec<(Key, Value)>) -> F,
 ) -> eyre::Result<u64> {
     let mut entries = Vec::new();
 
     let mut total_entries: u64 = 0;
 
     info!("Starting {} backfill", name);
+    let start_time = Instant::now();
 
     for entry in source {
         let entry = entry?;
 
-        entries.push(entry);
+        entries.push(entry.clone());
         total_entries += 1;
 
         if total_entries % (log_threshold as u64) == 0 {
-            info!("Processed {} {}", name, total_entries);
+            let progress = entry.0.estimate_progress();
+            let elapsed = start_time.elapsed();
+            let elapsed_secs = elapsed.as_secs_f64();
+            let estimated_total_time = if progress > 0.0 {
+                elapsed_secs / (progress)
+            } else {
+                0.0
+            };
+            let progress_pct = progress * 100.0;
+            let remaining_time = estimated_total_time - elapsed_secs;
+            let eta_duration = Duration::from_secs(remaining_time as u64);
+            info!(
+                "Processed {} {}, progress: {progress_pct:.2}%, ETA: {}s",
+                name,
+                total_entries,
+                eta_duration.as_secs()
+            );
         }
 
         if entries.len() >= storage_threshold {
@@ -150,15 +193,11 @@ impl<P: StateProviderFactory + DatabaseProviderFactory + Send, S: ExternalStateS
     BackfillJob<P, S>
 {
     pub fn new(storage: S, provider: P) -> Self {
-        Self {
-            target_block_number: None,
-            storage,
-            provider,
-        }
+        Self { storage, provider }
     }
 
     /// Backfill all leaf nodes (accounts and storage)
-    pub async fn backfill_leaf_nodes(&self) -> eyre::Result<()> {
+    async fn backfill_leaf_nodes(&self) -> eyre::Result<()> {
         self.backfill_hashed_accounts().await?;
         self.backfill_hashed_storage().await?;
         Ok(())
@@ -240,7 +279,7 @@ impl<P: StateProviderFactory + DatabaseProviderFactory + Send, S: ExternalStateS
     }
 
     /// Backfill accounts trie data
-    pub async fn backfill_accounts_trie(&self) -> eyre::Result<()> {
+    async fn backfill_accounts_trie(&self) -> eyre::Result<()> {
         let mut start_cursor = self
             .provider
             .database_provider_ro()?
@@ -294,6 +333,7 @@ impl<P: StateProviderFactory + DatabaseProviderFactory + Send, S: ExternalStateS
 
         let last_storage_branch = self.storage.get_last_storage_branch()?;
         if let Some((hashed_address, nibbles)) = last_storage_branch {
+            info!("Seeking to {:?}", (hashed_address, nibbles));
             start_cursor.seek_by_key_subkey(hashed_address, StoredNibblesSubKey(nibbles))?;
         }
 
@@ -338,19 +378,7 @@ impl<P: StateProviderFactory + DatabaseProviderFactory + Send, S: ExternalStateS
         Ok(())
     }
 
-    pub async fn process_operation(&mut self, operation: BackfillOperation) -> eyre::Result<()> {
-        match operation {
-            BackfillOperation::SetTargetBlockNumber {
-                target_block_number,
-            } => {
-                self.target_block_number = Some(target_block_number);
-            }
-        }
-
-        Ok(())
-    }
-
-    pub async fn step(&self) -> eyre::Result<()> {
+    pub async fn run(&self) -> eyre::Result<()> {
         if self.storage.get_earliest_block_number().await? == None {
             self.backfill_trie().await?;
 
@@ -365,26 +393,3 @@ impl<P: StateProviderFactory + DatabaseProviderFactory + Send, S: ExternalStateS
         Ok(())
     }
 }
-
-// pub struct BackfillManager<Node, Storage>
-// where
-//     Node: FullNodeComponents,
-//     Node::Provider: StateReader,
-//     Storage: ExternalStateStore,
-// {
-//     provider: Node::Provider,
-//     storage: Storage,
-// }
-
-// impl<Node, Storage> BackfillManager<Node, Storage>
-// where
-//     Node: FullNodeComponents,
-//     Node::Provider: StateReader,
-//     Storage: ExternalStateStore,
-// {
-//     /// Create a new BackfillManager instance
-//     pub fn new(provider: Node::Provider, storage: Storage) -> Self {
-//         Self { provider, storage }
-//     }
-
-// }

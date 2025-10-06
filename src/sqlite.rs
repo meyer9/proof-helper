@@ -215,6 +215,7 @@ impl ExternalHashedCursor for SqlitePreimageStoreStorageCursor {
     fn seek(&mut self, key: B256) -> ExternalStorageResult<Option<(B256, Self::Value)>> {
         let result = self.find_next_valid_storage(&key)?;
         self.last_seeked = result.as_ref().map(|(key, _)| *key);
+        // info!("StorageHashedCursor::seek({:?}) = {:?}", key, result);
         Ok(result)
     }
 
@@ -232,11 +233,14 @@ impl ExternalHashedCursor for SqlitePreimageStoreStorageCursor {
         };
 
         self.last_seeked = result.as_ref().map(|(key, _)| *key);
+        // info!("StorageHashedCursor::next() = {:?}", result);
         Ok(result)
     }
 
     fn is_storage_empty(&mut self) -> ExternalStorageResult<bool> {
-        Ok(self.find_next_valid_storage(&B256::ZERO)?.is_none())
+        let result = self.find_next_valid_storage(&B256::ZERO)?.is_none();
+        // info!("StorageHashedCursor::is_storage_empty() = {:?}", result);
+        Ok(result)
     }
 }
 
@@ -246,6 +250,7 @@ impl ExternalHashedCursor for SqlitePreimageStoreAccountCursor {
     fn seek(&mut self, key: B256) -> ExternalStorageResult<Option<(B256, Self::Value)>> {
         let result = self.find_next_valid_account(&key)?;
         self.last_seeked = result.as_ref().map(|(key, _)| *key);
+        // info!("AccountHashedCursor::seek({:?}) = {:?}", key, result);
         Ok(result)
     }
 
@@ -263,11 +268,14 @@ impl ExternalHashedCursor for SqlitePreimageStoreAccountCursor {
         };
 
         self.last_seeked = result.as_ref().map(|(key, _)| *key);
+        // info!("AccountHashedCursor::next() = {:?}", result);
         Ok(result)
     }
 
     fn is_storage_empty(&mut self) -> ExternalStorageResult<bool> {
-        Ok(self.find_next_valid_account(&B256::ZERO)?.is_none())
+        let result = self.find_next_valid_account(&B256::ZERO)?.is_none();
+        // info!("AccountHashedCursor::is_storage_empty() = {:?}", result);
+        Ok(result)
     }
 }
 
@@ -422,6 +430,16 @@ impl ExternalTrieCursor for SqlitePreimageStoreCursor {
         };
 
         self.last_seeked = Some(returned_path);
+        // info!(
+        //     "{}::seek_exact({:?}) = {:?}",
+        //     if let Some(hashed_address) = self.hashed_address {
+        //         "StorageTrieCursor"
+        //     } else {
+        //         "AccountTrieCursor"
+        //     },
+        //     path,
+        //     (returned_path, branch.clone())
+        // );
         Ok(Some((path, branch)))
     }
 
@@ -434,6 +452,16 @@ impl ExternalTrieCursor for SqlitePreimageStoreCursor {
             return Ok(None);
         };
         self.last_seeked = Some(returned_path);
+        // info!(
+        //     "{}::seek({:?}) = {:?}",
+        //     if let Some(hashed_address) = self.hashed_address {
+        //         "StorageTrieCursor"
+        //     } else {
+        //         "AccountTrieCursor"
+        //     },
+        //     path,
+        //     (returned_path, branch.clone())
+        // );
         Ok(Some((returned_path, branch)))
     }
 
@@ -443,18 +471,53 @@ impl ExternalTrieCursor for SqlitePreimageStoreCursor {
             if let Ok(Some((path, _branch))) = &result {
                 self.last_seeked = Some(*path);
             }
+            // info!(
+            //     "{}::next() = {:?}",
+            //     if let Some(hashed_address) = self.hashed_address {
+            //         "StorageTrieCursor"
+            //     } else {
+            //         "AccountTrieCursor"
+            //     },
+            //     result
+            // );
             return result;
         };
         let Some((returned_path, branch)) =
             self.seek_first_non_empty_path_after(last_seeked, false)?
         else {
+            // info!(
+            //     "{}::next() = None",
+            //     if let Some(hashed_address) = self.hashed_address {
+            //         "StorageTrieCursor"
+            //     } else {
+            //         "AccountTrieCursor"
+            //     },
+            // );
             return Ok(None);
         };
         self.last_seeked = Some(returned_path);
+        // info!(
+        //     "{}::next() = {:?}",
+        //     if let Some(hashed_address) = self.hashed_address {
+        //         "StorageTrieCursor"
+        //     } else {
+        //         "AccountTrieCursor"
+        //     },
+        //     (returned_path, branch.clone())
+        // );
         Ok(Some((returned_path, branch)))
     }
 
     fn current(&mut self) -> ExternalStorageResult<Option<Nibbles>> {
+        // info!(
+        //     "{}::current() = {:?}",
+        //     if let Some(hashed_address) = self.hashed_address {
+        //         "StorageTrieCursor"
+        //     } else {
+        //         "AccountTrieCursor"
+        //     },
+        //     self.last_seeked
+        // );
         Ok(self.last_seeked)
     }
 }
@@ -632,7 +695,7 @@ impl ExternalStateStore for SqlitePreimageStore {
     type StorageCursor = SqlitePreimageStoreStorageCursor;
     type AccountHashedCursor = SqlitePreimageStoreAccountCursor;
 
-    fn get_latest_block_number(&self) -> ExternalStorageResult<u64> {
+    async fn get_latest_block_number(&self) -> ExternalStorageResult<u64> {
         let result = self
             .connect()?
             .query_row("SELECT MAX(block_number) FROM branch_nodes", [], |r| {
@@ -640,7 +703,13 @@ impl ExternalStateStore for SqlitePreimageStore {
             })
             .map_err(Into::<ExternalStorageError>::into)?;
 
-        Ok(result)
+        let earliest_block_number = self
+            .get_earliest_block_number()
+            .await?
+            .map(|(bn, _)| bn)
+            .unwrap_or(0);
+
+        Ok(result.max(earliest_block_number))
     }
 
     fn get_last_storage_leaf(&self) -> ExternalStorageResult<Option<(B256, B256)>> {
@@ -675,7 +744,7 @@ impl ExternalStateStore for SqlitePreimageStore {
 
     fn get_last_storage_branch(&self) -> ExternalStorageResult<Option<(B256, Nibbles)>> {
         let result = self.connect()?.query_row(
-            "SELECT hashed_address, path FROM storage_nodes WHERE block_number = ? ORDER BY hashed_address DESC, path DESC LIMIT 1",
+            "SELECT hashed_address, path FROM branch_nodes WHERE block_number = ? AND hashed_address IS NOT NULL ORDER BY key DESC LIMIT 1",
             params![0],
             |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
         ).optional()

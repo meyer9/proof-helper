@@ -5710,6 +5710,7 @@ dependencies = [
  "eyre",
  "futures-util",
  "hex",
+ "itertools 0.14.0",
  "jsonrpsee",
  "jsonrpsee-core",
  "jsonrpsee-types",
