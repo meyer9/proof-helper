@@ -71,19 +71,16 @@ impl<'a, P: ExternalStateStore> BlockHashReader for ExternalOverlayStateProvider
 impl<'a, P: ExternalStateStore + Clone> StateRootProvider
     for ExternalOverlayStateProviderRef<'a, P>
 {
-    #[tracing::instrument(skip(self, state))]
     fn state_root(&self, state: HashedPostState) -> ProviderResult<B256> {
         StateRoot::overlay_root(self.storage.clone(), self.block_number, state)
             .map_err(|err| ProviderError::Database(err.into()))
     }
 
-    #[tracing::instrument(skip(self, input))]
     fn state_root_from_nodes(&self, input: TrieInput) -> ProviderResult<B256> {
         StateRoot::overlay_root_from_nodes(self.storage.clone(), self.block_number, input)
             .map_err(|err| ProviderError::Database(err.into()))
     }
 
-    #[tracing::instrument(skip(self, state))]
     fn state_root_with_updates(
         &self,
         state: HashedPostState,
@@ -92,7 +89,6 @@ impl<'a, P: ExternalStateStore + Clone> StateRootProvider
             .map_err(|err| ProviderError::Database(err.into()))
     }
 
-    #[tracing::instrument(skip(self, input))]
     fn state_root_from_nodes_with_updates(
         &self,
         input: TrieInput,
@@ -109,13 +105,11 @@ impl<'a, P: ExternalStateStore + Clone> StateRootProvider
 impl<'a, P: ExternalStateStore + Clone> StorageRootProvider
     for ExternalOverlayStateProviderRef<'a, P>
 {
-    #[tracing::instrument(skip(self, storage), level = "info")]
     fn storage_root(&self, address: Address, storage: HashedStorage) -> ProviderResult<B256> {
         StorageRoot::overlay_root(self.storage.clone(), self.block_number, address, storage)
             .map_err(|err| ProviderError::Database(err.into()))
     }
 
-    #[tracing::instrument(skip(self, storage), level = "info")]
     fn storage_proof(
         &self,
         address: Address,
@@ -132,7 +126,6 @@ impl<'a, P: ExternalStateStore + Clone> StorageRootProvider
         .map_err(ProviderError::from)
     }
 
-    #[tracing::instrument(skip(self, storage), level = "info")]
     fn storage_multiproof(
         &self,
         address: Address,
@@ -153,7 +146,6 @@ impl<'a, P: ExternalStateStore + Clone> StorageRootProvider
 impl<'a, P: ExternalStateStore + Clone> StateProofProvider
     for ExternalOverlayStateProviderRef<'a, P>
 {
-    #[tracing::instrument(skip(self, input, slots), level = "info")]
     fn proof(
         &self,
         input: TrieInput,
@@ -170,7 +162,6 @@ impl<'a, P: ExternalStateStore + Clone> StateProofProvider
         .map_err(ProviderError::from)
     }
 
-    #[tracing::instrument(skip(self, input, targets), level = "info")]
     fn multiproof(
         &self,
         input: TrieInput,
@@ -180,7 +171,6 @@ impl<'a, P: ExternalStateStore + Clone> StateProofProvider
             .map_err(ProviderError::from)
     }
 
-    #[tracing::instrument(skip(self, input, target), level = "info")]
     fn witness(&self, input: TrieInput, target: HashedPostState) -> ProviderResult<Vec<Bytes>> {
         TrieWitness::overlay_witness(self.storage.clone(), self.block_number, input, target)
             .map_err(ProviderError::from)
@@ -189,14 +179,12 @@ impl<'a, P: ExternalStateStore + Clone> StateProofProvider
 }
 
 impl<'a, P: ExternalStateStore> HashedPostStateProvider for ExternalOverlayStateProviderRef<'a, P> {
-    #[tracing::instrument(skip(self, bundle_state), level = "info")]
     fn hashed_post_state(&self, bundle_state: &BundleState) -> HashedPostState {
         HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle_state.state())
     }
 }
 
 impl<'a, P: ExternalStateStore> AccountReader for ExternalOverlayStateProviderRef<'a, P> {
-    #[tracing::instrument(skip(self), level = "info")]
     fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
         let hashed_key = keccak256(&address.0);
         Ok(self
@@ -217,7 +205,6 @@ impl<'a, P: ExternalStateStore> AccountReader for ExternalOverlayStateProviderRe
 }
 
 impl<'a, P: ExternalStateStore + Clone> StateProvider for ExternalOverlayStateProviderRef<'a, P> {
-    #[tracing::instrument(skip(self), level = "info")]
     fn storage(&self, address: Address, storage_key: B256) -> ProviderResult<Option<StorageValue>> {
         let hashed_key = keccak256(storage_key);
         Ok(self
@@ -238,7 +225,6 @@ impl<'a, P: ExternalStateStore + Clone> StateProvider for ExternalOverlayStatePr
 }
 
 impl<'a, P: ExternalStateStore> BytecodeReader for ExternalOverlayStateProviderRef<'a, P> {
-    #[tracing::instrument(skip(self), level = "info")]
     fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>> {
         self.latest.bytecode_by_hash(code_hash)
     }
