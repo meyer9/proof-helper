@@ -48,7 +48,6 @@ pub trait EthApiOverride {
 pub struct EthApiExt<Eth, P, Provider> {
     eth_api: Eth,
     preimage_store: P,
-    provider: Provider,
 }
 
 impl<Eth, P, Provider> EthApiExt<Eth, P, Provider>

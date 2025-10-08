@@ -3,8 +3,8 @@ use reth::providers::StateProvider;
 use reth::{
     primitives::{Account, Bytecode},
     providers::{
-        AccountReader, BlockHashReader, BytecodeReader, DBProvider, HashedPostStateProvider,
-        ProviderError, ProviderResult, StateProofProvider, StateRootProvider, StorageRootProvider,
+        AccountReader, BlockHashReader, BytecodeReader, HashedPostStateProvider, ProviderError,
+        ProviderResult, StateProofProvider, StateRootProvider, StorageRootProvider,
     },
     revm::{
         db::BundleState,

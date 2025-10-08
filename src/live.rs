@@ -3,7 +3,6 @@ use crate::{
     provider::ExternalOverlayStateProviderRef,
 };
 use alloy_primitives::{FixedBytes, map::FbBuildHasher};
-use itertools::Itertools;
 use reth::{
     api::{FullNodeComponents, NodePrimitives},
     builder::NodeTypes,
