@@ -1,180 +1,133 @@
 use futures_util::TryStreamExt;
 use op_reth::node::OpNode;
-use op_reth::primitives::OpPrimitives;
 use reth::{
-    api::{ConfigureEvm, FullNodeComponents, NodePrimitives},
+    api::{FullNodeComponents, NodePrimitives},
     builder::NodeTypes,
+    chainspec::ChainInfo,
     core::primitives::AlloyBlockHeader,
-    primitives::RecoveredBlock,
-    providers::{BlockReader, StateProviderFactory, StateReader, TransactionVariant},
-    revm::{
-        database::StateProviderDatabase,
-        primitives::{
-            keccak256,
-            map::{B256Map, B256Set},
-        },
+    providers::{
+        BlockNumReader, BlockReader, DBProvider, DatabaseProviderFactory, StateReader,
+        TransactionVariant,
     },
 };
-use reth_evm::execute::Executor;
-use reth_exex::{ExExContext, ExExEvent, ExExNotification};
-use reth_tracing::tracing::{info, warn};
-use reth_trie::TrieInput;
-use reth_trie::{HashedPostState, KeccakKeyHasher};
-use std::sync::Arc;
 
+use reth_exex::{ExExContext, ExExEvent, ExExNotification};
+use std::sync::Arc;
+use tracing::info;
+
+mod backfill;
 mod config;
-mod dynamodb;
+mod live;
+mod proof;
+mod provider;
+mod rpc;
+mod sqlite;
 mod storage;
 
 use config::{ProofHelperConfig, StorageBackend};
-use dynamodb::DynamoDbPreimageStore;
-use storage::{PreimageBatch, PreimageEntry, PreimageStore};
+use sqlite::SqlitePreimageStore;
+use storage::{BranchNodeEntry, ExternalStateStore, TrieBranchesBatch};
+
+use crate::{
+    backfill::BackfillJob,
+    live::LiveTrieCollector,
+    rpc::{EthApiExt, EthApiOverrideServer},
+};
 
 /// Proof Helper ExEx - processes blocks and tracks state changes
-pub struct ProofHelper<Node>
+pub struct ProofHelper<Node, PreimageStore>
 where
     Node: FullNodeComponents,
     Node::Provider: StateReader,
 {
     ctx: ExExContext<Node>,
-    storage: Arc<dyn PreimageStore>,
+    storage: PreimageStore,
 }
 
-impl<Node> ProofHelper<Node>
+impl<Node, Primitives, PreimageStore> ProofHelper<Node, PreimageStore>
 where
-    Node: FullNodeComponents<Types: NodeTypes<Primitives = OpPrimitives>>,
-    Node::Provider: StateReader + StateProviderFactory + BlockReader,
+    Node: FullNodeComponents<Types: NodeTypes<Primitives = Primitives>>,
+    Primitives: NodePrimitives,
+    PreimageStore: ExternalStateStore + Clone + 'static,
 {
     /// Create a new ProofHelper instance
-    pub fn new(ctx: ExExContext<Node>, storage: Arc<dyn PreimageStore>) -> Self {
+    pub fn new(ctx: ExExContext<Node>, storage: PreimageStore) -> Self {
         Self { ctx, storage }
     }
 
-    fn process_block(
-        &self,
-        block: &RecoveredBlock<<<Node::Types as NodeTypes>::Primitives as NodePrimitives>::Block>,
-    ) -> eyre::Result<()> {
-        let block_number = block.header().number();
-        let parent_hash = block.header().parent_hash();
-        let state_provider = self.ctx.provider().history_by_block_hash(parent_hash)?;
+    /// Main execution loop for the ExEx
+    pub async fn run(mut self, _config: ProofHelperConfig) -> eyre::Result<()> {
+        // Run the earliest block job (idempotent)
+        let db_provider = self
+            .ctx
+            .provider()
+            .database_provider_ro()?
+            .disable_long_read_transaction_safety();
+        let db_tx = db_provider.into_tx();
+        let ChainInfo {
+            best_number,
+            best_hash,
+        } = self.ctx.provider().chain_info()?;
+        BackfillJob::new(self.storage.clone(), &db_tx)
+            .run(best_number, best_hash)
+            .await?;
 
-        let db = StateProviderDatabase::new(&state_provider);
-        let block_executor = self.ctx.evm_config().batch_executor(db);
-
-        let execution_result = block_executor
-            .execute(&(*block).clone())
-            .map_err(|err| eyre::eyre!(err))?;
-
-        let hashed_state =
-            HashedPostState::from_bundle_state::<KeccakKeyHasher>(execution_result.state.state());
-
-        let mut targets = B256Map::<B256Set>::with_capacity_and_hasher(
-            hashed_state.storages.len(),
-            Default::default(),
+        let collector = LiveTrieCollector::<Node, PreimageStore>::new(
+            self.ctx.evm_config().clone(),
+            self.ctx.provider().clone(),
+            self.storage.clone(),
         );
 
-        for (address, storage) in hashed_state.storages.iter() {
-            let set = targets.entry(address.clone()).or_default();
-            for (slot, _) in storage.storage.iter() {
-                set.insert(slot.clone());
+        // TODO: we should disallow processing blocks until the backfill job is complete
+
+        // check if we can process up to the latest block
+        let Some(latest_stored_block_number) = self.storage.get_latest_block_number().await? else {
+            return Err(eyre::eyre!("No blocks stored"));
+        };
+        let ChainInfo {
+            best_number: latest_block_number,
+            ..
+        } = self.ctx.provider().chain_info()?;
+
+        if latest_stored_block_number < latest_block_number {
+            info!(
+                "Backfilling blocks from {} to {}",
+                latest_stored_block_number, latest_block_number
+            );
+            for block_number in (latest_stored_block_number + 1)..=latest_block_number {
+                let Some(block) = self
+                    .ctx
+                    .provider()
+                    .recovered_block(block_number.into(), TransactionVariant::NoHash)?
+                else {
+                    return Err(eyre::eyre!("Block {} not found", block_number));
+                };
+                collector.execute_and_store_block_updates(&block).await?;
             }
+        } else {
+            info!(
+                "Skipping backfill, latest stored block number is up to date (latest stored: {}, latest: {})",
+                latest_stored_block_number, latest_block_number
+            );
         }
-
-        // for addresses, ensure that the key exists, otherwise insert an empty set
-        for (address, _) in hashed_state.accounts.iter() {
-            targets.entry(address.clone()).or_default();
-        }
-
-        // prove all the changed keys
-        let multiproof = state_provider.multiproof(
-            TrieInput::from_state(hashed_state),
-            targets.into_iter().collect(),
-        )?;
-
-        let mut preimages = Vec::new();
-
-        for (nibbles, data) in multiproof.account_subtree.iter() {
-            let hash = keccak256(data);
-
-            preimages.push(PreimageEntry {
-                hash: hash,
-                preimage: data.to_vec(),
-                hashed_address: None,
-                path: nibbles.clone(),
-                block_number: block_number,
-            });
-        }
-
-        for (account_hash, storage_multiproof) in multiproof.storages.iter() {
-            for (nibbles, data) in storage_multiproof.subtree.iter() {
-                let hash = keccak256(data);
-
-                preimages.push(PreimageEntry {
-                    hash: hash,
-                    preimage: data.to_vec(),
-                    hashed_address: Some(account_hash.clone()),
-                    path: nibbles.clone(),
-                    block_number: block_number,
-                });
-            }
-        }
-
-        // Store the batch
-        let storage_clone = Arc::clone(&self.storage);
-        tokio::spawn(async move {
-            if let Err(e) = storage_clone
-                .store_preimages_batch(PreimageBatch {
-                    block_number: block_number,
-                    items: preimages.clone(),
-                })
-                .await
-            {
-                warn!(
-                    "Failed to store preimages for block {}: {}",
-                    block_number, e
-                );
-            } else {
-                info!(
-                    "Successfully stored {} preimages for block {}",
-                    preimages.len(),
-                    block_number
-                );
-            }
-        });
-
-        Ok(())
-    }
-
-    /// Main execution loop for the ExEx
-    pub async fn run(mut self, config: ProofHelperConfig) -> eyre::Result<()> {
-        let max_block_diff = config.processing.max_block_diff;
 
         while let Some(notification) = self.ctx.notifications.try_next().await? {
             match &notification {
                 ExExNotification::ChainCommitted { new } => {
-                    let head_block_number = new.tip().num_hash().number;
+                    let Some(latest_stored_block_number) =
+                        self.storage.get_latest_block_number().await?
+                    else {
+                        // db deleted?
+                        return Err(eyre::eyre!("No blocks stored"));
+                    };
+                    if new.tip().number() <= latest_stored_block_number {
+                        continue;
+                    }
+                    for block_number in (latest_stored_block_number + 1)..=new.tip().number() {
+                        let block = new.blocks().get(&block_number).unwrap();
 
-                    for (block_number, block) in new.blocks() {
-                        if head_block_number.saturating_sub(*block_number) > max_block_diff {
-                            warn!(
-                                "Block {} is too far behind the head block {}, skipping",
-                                block_number, head_block_number
-                            );
-                            continue;
-                        }
-
-                        let Some(parent_block) = self.ctx.provider().recovered_block(
-                            block.header().parent_hash().into(),
-                            TransactionVariant::NoHash,
-                        )?
-                        else {
-                            warn!("Parent block not found for block {}", block_number);
-                            continue;
-                        };
-
-                        if let Err(err) = self.process_block(&parent_block) {
-                            warn!("Error processing block {}: {}", block_number, err);
-                        }
+                        // By this point, we know that the parent block is stored
+                        collector.execute_and_store_block_updates(block).await?;
                     }
                 }
                 _ => {}
@@ -193,25 +146,22 @@ where
 }
 
 /// Create storage backend based on configuration
-async fn create_storage(config: &ProofHelperConfig) -> eyre::Result<Arc<dyn PreimageStore>> {
+async fn create_storage(config: &ProofHelperConfig) -> eyre::Result<Arc<SqlitePreimageStore>> {
     match config.storage.backend {
-        StorageBackend::DynamoDB => {
-            info!("Using DynamoDB storage backend");
-            let dynamodb_config = config.storage.dynamodb.as_ref().ok_or_else(|| {
-                eyre::eyre!("DynamoDB configuration is required when using DynamoDB backend")
+        StorageBackend::SQLite => {
+            info!("Using SQLite storage backend");
+            let sqlite_cfg = config.storage.sqlite.as_ref().ok_or_else(|| {
+                eyre::eyre!("SQLite configuration is required when using SQLite backend")
             })?;
 
-            let store = DynamoDbPreimageStore::new(dynamodb_config)
+            let store = SqlitePreimageStore::new(&sqlite_cfg.db_path)
                 .await
-                .map_err(|e| eyre::eyre!("Failed to create DynamoDB store: {}", e))?;
-
-            // Run health check to ensure connection is working
+                .map_err(|e| eyre::eyre!("Failed to create SQLite store: {}", e))?;
             store
                 .health_check()
                 .await
-                .map_err(|e| eyre::eyre!("DynamoDB health check failed: {}", e))?;
-
-            info!("DynamoDB store initialized successfully");
+                .map_err(|e| eyre::eyre!("SQLite health check failed: {}", e))?;
+            info!("SQLite store initialized successfully");
             Ok(Arc::new(store))
         }
     }
@@ -222,17 +172,32 @@ fn main() -> eyre::Result<()> {
     let config = ProofHelperConfig::load_from_env()
         .map_err(|e| eyre::eyre!("Failed to load configuration: {}", e))?;
 
+    // run get_storage and wait for it to complete
+    let storage = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            create_storage(&config)
+                .await
+                .map_err(|e| eyre::eyre!("Failed to create storage backend: {}", e))
+        })?;
+
+    let storage_2 = storage.clone();
+
     op_reth::cli::Cli::parse_args().run(async move |builder, _| {
         let handle = builder
             .node(OpNode::default())
             .install_exex("proof-helper", async move |ctx| {
-                // Create storage backend based on configuration
-                let storage = create_storage(&config)
-                    .await
-                    .map_err(|e| eyre::eyre!("Failed to create storage backend: {}", e))?;
+                // let builder = ctx.components.payload_builder_handle();
 
                 let proof_helper = ProofHelper::new(ctx, storage);
                 Ok(proof_helper.run(config))
+            })
+            .extend_rpc_modules(move |ctx| {
+                let api_ext = EthApiExt::new(ctx.registry.eth_api().clone(), storage_2);
+                ctx.modules.replace_configured(api_ext.into_rpc())?;
+                Ok(())
             })
             .launch()
             .await?;

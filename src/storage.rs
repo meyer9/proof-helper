@@ -1,29 +1,14 @@
-use std::collections::HashMap;
-
-use reth::revm::primitives::B256;
-use reth_trie::Nibbles;
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PreimageEntry {
-    pub hash: B256,
-    pub preimage: Vec<u8>,
-    pub hashed_address: Option<B256>,
-    pub path: Nibbles,
-    pub block_number: u64,
-}
-
-/// Batch of preimages to be stored together
-#[derive(Debug, Clone)]
-pub struct PreimageBatch {
-    /// Block number for all items in this batch
-    pub block_number: u64,
-    /// Map of hash to preimage data
-    pub items: Vec<PreimageEntry>,
-}
+use alloy_primitives::U256;
+use auto_impl::auto_impl;
+use reth::primitives::Account;
+use reth::{primitives::StorageEntry, revm::primitives::B256};
+use reth_db_api::DatabaseError;
+use reth_trie::{BranchNodeCompact, Nibbles};
+use std::fmt::Debug;
 
 /// Error types for preimage storage operations
 #[derive(Debug, thiserror::Error)]
-pub enum PreimageStorageError {
+pub enum ExternalStorageError {
     #[error("Storage operation failed: {0}")]
     StorageError(String),
     #[error("Serialization error: {0}")]
@@ -34,96 +19,163 @@ pub enum PreimageStorageError {
     BatchError(String),
     #[error("Connection error: {0}")]
     ConnectionError(String),
+    #[error("Table creation error: {0}")]
+    TableCreationError(String),
+}
+
+impl Into<DatabaseError> for ExternalStorageError {
+    fn into(self) -> DatabaseError {
+        DatabaseError::Other(self.to_string())
+    }
+}
+
+impl From<rusqlite::Error> for ExternalStorageError {
+    fn from(error: rusqlite::Error) -> Self {
+        ExternalStorageError::StorageError(error.to_string())
+    }
 }
 
 /// Result type for storage operations
-pub type PreimageStorageResult<T> = Result<T, PreimageStorageError>;
+pub type ExternalStorageResult<T> = Result<T, ExternalStorageError>;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BranchNodeEntry {
+    pub path: Nibbles,
+    pub hashed_address: Option<B256>,
+    pub branch: Option<BranchNodeCompact>,
+}
+
+/// Batch of preimages to be stored together
+#[derive(Debug, Clone)]
+pub struct TrieBranchesBatch {
+    /// Block number for all items in this batch
+    pub block_number: u64,
+    /// Map of hash to preimage data
+    pub items: Vec<BranchNodeEntry>,
+}
+
+pub trait ExternalTrieCursor: Send + Sync {
+    fn seek_exact(
+        &mut self,
+        path: Nibbles,
+    ) -> ExternalStorageResult<Option<(Nibbles, BranchNodeCompact)>>;
+    fn seek(
+        &mut self,
+        path: Nibbles,
+    ) -> ExternalStorageResult<Option<(Nibbles, BranchNodeCompact)>>;
+    fn next(&mut self) -> ExternalStorageResult<Option<(Nibbles, BranchNodeCompact)>>;
+    fn current(&mut self) -> ExternalStorageResult<Option<Nibbles>>;
+}
+
+pub trait ExternalHashedCursor: Send + Sync {
+    /// Value returned by the cursor.
+    type Value: std::fmt::Debug;
+
+    /// Seek an entry greater or equal to the given key and position the cursor there.
+    /// Returns the first entry with the key greater or equal to the sought key.
+    fn seek(&mut self, key: B256) -> ExternalStorageResult<Option<(B256, Self::Value)>>;
+
+    /// Move the cursor to the next entry and return it.
+    fn next(&mut self) -> ExternalStorageResult<Option<(B256, Self::Value)>>;
+
+    /// Returns `true` if there are no entries for a given key.
+    fn is_storage_empty(&mut self) -> ExternalStorageResult<bool>;
+}
 
 /// Trait for storing and retrieving preimage data
-/// 
+///
 /// This trait provides an abstraction over different storage backends (DynamoDB, etc.)
 /// and supports batch operations for efficient storage of preimages with block-based indexing.
-/// 
+///
 /// Storage model: hash (primary key) -> preimage data, with block_number as secondary index
 #[async_trait::async_trait]
-pub trait PreimageStore: Send + Sync {
-    /// Store a single preimage
-    /// 
+#[auto_impl(Arc)]
+pub trait ExternalStateStore: Send + Sync + Debug {
+    type TrieCursor: ExternalTrieCursor;
+    type StorageCursor: ExternalHashedCursor<Value = U256>;
+    type AccountHashedCursor: ExternalHashedCursor<Value = Account>;
+
+    /// Store a single preimage. Storing None will store a NULL value which will be used to
+    /// signal that the preimage was deleted at that block.
+    ///
     /// # Arguments
     /// * `hash` - Hash of the preimage (used as primary key)
     /// * `preimage` - The preimage data to store
     /// * `block_number` - Block number for secondary indexing and pruning
-    async fn store_preimage(
+    async fn store_trie_branch(
         &self,
-        hash: B256,
-        preimage: Vec<u8>,
-        hashed_address: Option<B256>,
-        path: Nibbles,
         block_number: u64,
-    ) -> PreimageStorageResult<()>;
+        path: Nibbles,
+        hashed_address: Option<B256>,
+        branch: Option<BranchNodeCompact>,
+    ) -> ExternalStorageResult<()>;
 
     /// Store multiple preimages in a batch operation
-    /// 
+    ///
     /// This should be more efficient than multiple individual stores
-    /// 
+    ///
     /// # Arguments
     /// * `batch` - Batch of preimages to store
-    async fn store_preimages_batch(&self, batch: PreimageBatch) -> PreimageStorageResult<()>;
+    async fn store_trie_branches(&self, batch: TrieBranchesBatch) -> ExternalStorageResult<()>;
 
-    /// Retrieve a preimage by its hash
-    /// 
-    /// # Arguments
-    /// * `hash` - Hash of the preimage to retrieve
-    async fn get_preimage(&self, hash: &B256) -> PreimageStorageResult<Option<Vec<u8>>>;
-
-    /// Retrieve multiple preimages by their hashes
-    /// 
-    /// # Arguments
-    /// * `hashes` - Vector of hashes to retrieve
-    /// 
-    /// # Returns
-    /// * HashMap with found preimages (missing items are not included)
-    async fn get_preimages_batch(
+    async fn store_hashed_accounts(
         &self,
-        hashes: &[B256],
-    ) -> PreimageStorageResult<HashMap<B256, Vec<u8>>>;
+        accounts: Vec<(B256, Option<Account>)>,
+        block_number: u64,
+    ) -> ExternalStorageResult<()>;
 
-    /// Check if a preimage exists
-    /// 
-    /// # Arguments
-    /// * `hash` - Hash to check for existence
-    async fn exists(&self, hash: &B256) -> PreimageStorageResult<bool>;
+    async fn store_hashed_storages(
+        &self,
+        storages: Vec<(B256, StorageEntry)>,
+        block_number: u64,
+    ) -> ExternalStorageResult<()>;
 
-    /// Prune preimages older than the specified block number
-    /// 
-    /// This uses the secondary index on block number for efficient pruning
-    /// 
-    /// # Arguments
-    /// * `before_block` - Remove preimages from blocks before this number
-    /// 
-    /// # Returns
-    /// * Number of items deleted
-    async fn prune_before_block(&self, before_block: u64) -> PreimageStorageResult<u64>;
+    /// Get the earliest block number and hash that has been stored
+    ///
+    /// This is used to determine the block number of trie nodes with block number 0.
+    /// All earliest block numbers are stored in 0 to reduce updates required to prune trie nodes.
+    async fn get_earliest_block_number(&self) -> ExternalStorageResult<Option<(u64, B256)>>;
 
-    /// Get the count of stored preimages for a specific block
-    /// 
-    /// # Arguments
-    /// * `block_number` - Block number to count preimages for
-    async fn count_preimages_for_block(&self, block_number: u64) -> PreimageStorageResult<u64>;
+    /// Get the latest block number that has been stored
+    async fn get_latest_block_number(&self) -> ExternalStorageResult<Option<u64>>;
 
-    /// Get all preimage hashes for a specific block
-    /// 
-    /// Useful for verification or debugging
-    /// 
-    /// # Arguments
-    /// * `block_number` - Block number to get hashes for
-    async fn get_hashes_for_block(&self, block_number: u64) -> PreimageStorageResult<Vec<B256>>;
+    /// Set the earliest block number and hash that has been stored
+    async fn set_earliest_block_number(
+        &self,
+        block_number: u64,
+        hash: B256,
+    ) -> ExternalStorageResult<()>;
 
     /// Health check for the storage backend
-    async fn health_check(&self) -> PreimageStorageResult<()>;
+    async fn health_check(&self) -> ExternalStorageResult<()>;
+
+    /// Get a trie cursor for the storage backend
+    fn trie_cursor(
+        &self,
+        hashed_address: Option<B256>,
+        max_block_number: u64,
+    ) -> ExternalStorageResult<Self::TrieCursor>;
+
+    /// Get a storage cursor for the storage backend
+    fn storage_hashed_cursor(
+        &self,
+        hashed_address: B256,
+        max_block_number: u64,
+    ) -> ExternalStorageResult<Self::StorageCursor>;
+
+    /// Get an account hashed cursor for the storage backend
+    fn account_hashed_cursor(
+        &self,
+        max_block_number: u64,
+    ) -> ExternalStorageResult<Self::AccountHashedCursor>;
+
+    fn get_last_storage_leaf(&self) -> ExternalStorageResult<Option<(B256, B256)>>;
+    fn get_last_account_leaf(&self) -> ExternalStorageResult<Option<B256>>;
+    fn get_last_storage_branch(&self) -> ExternalStorageResult<Option<(B256, Nibbles)>>;
+    fn get_last_account_branch(&self) -> ExternalStorageResult<Option<Nibbles>>;
 }
 
-impl PreimageBatch {
+impl TrieBranchesBatch {
     /// Create a new empty batch for a specific block
     pub fn new(block_number: u64) -> Self {
         Self {

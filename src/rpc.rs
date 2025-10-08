@@ -1,0 +1,136 @@
+use async_trait::async_trait;
+use jsonrpsee::proc_macros::rpc;
+use jsonrpsee_core::RpcResult;
+use reth::{
+    providers::{BlockIdReader, ProviderError, ProviderResult, StateProviderBox},
+    revm::primitives::Address,
+    rpc::{
+        api::eth::helpers::FullEthApi,
+        server_types::eth::EthApiError,
+        types::{BlockId, EIP1186AccountProofResponse, serde_helpers::JsonStorageKey},
+    },
+};
+
+use crate::{provider::ExternalOverlayStateProviderRef, storage::ExternalStateStore};
+
+#[cfg_attr(not(test), rpc(server, namespace = "eth"))]
+#[cfg_attr(test, rpc(server, client, namespace = "eth"))]
+pub trait EthApiOverride {
+    /// Returns the account and storage values of the specified account including the Merkle-proof.
+    /// This call can be used to verify that the data you are pulling from is not tampered with.
+    #[method(name = "getProof")]
+    async fn get_proof(
+        &self,
+        address: Address,
+        keys: Vec<JsonStorageKey>,
+        block_number: Option<BlockId>,
+    ) -> RpcResult<EIP1186AccountProofResponse>;
+}
+
+// #[cfg_attr(not(test), rpc(server, namespace = "debug"))]
+// #[cfg_attr(test, rpc(server, client, namespace = "debug"))]
+// pub trait DebugApiOverride<Attributes> {
+//     #[method(name = "executePayload")]
+//     async fn execute_payload(
+//         &self,
+//         parent_block_hash: B256,
+//         attributes: Attributes,
+//     ) -> RpcResult<ExecutionWitness>;
+
+//     #[method(name = "executionWitness")]
+//     async fn execution_witness(&self, block: BlockNumberOrTag)
+//         -> RpcResult<ExecutionWitness>;
+// }
+
+#[derive(Debug)]
+pub struct EthApiExt<Eth, P> {
+    eth_api: Eth,
+    preimage_store: P,
+}
+
+impl<Eth, P> EthApiExt<Eth, P>
+where
+    Eth: FullEthApi + Send + Sync + 'static,
+    jsonrpsee_types::error::ErrorObject<'static>: From<Eth::Error>,
+    P: ExternalStateStore + Clone + 'static,
+{
+    async fn state_provider(&self, block_id: Option<BlockId>) -> ProviderResult<StateProviderBox> {
+        let block_id = block_id.unwrap_or_default();
+        // Check whether the distance to the block exceeds the maximum configured window.
+        let block_number = self
+            .eth_api
+            .provider()
+            .block_number_for_id(block_id)?
+            .ok_or(EthApiError::HeaderNotFound(block_id))
+            .map_err(|e| ProviderError::other(e))?;
+
+        let historical_provider = self
+            .eth_api
+            .state_at_block_id(block_id)
+            .await
+            .map_err(|e| ProviderError::other(e))?;
+
+        let (Some(latest_block_number), Some((earliest_block_number, _))) = (
+            self.preimage_store
+                .get_latest_block_number()
+                .await
+                .map_err(|e| ProviderError::other(e))?,
+            self.preimage_store
+                .get_earliest_block_number()
+                .await
+                .map_err(|e| ProviderError::other(e))?,
+        ) else {
+            // if no earliest block, db is empty - use historical provider
+            return Ok(historical_provider);
+        };
+
+        if block_number < earliest_block_number || block_number > latest_block_number {
+            return Ok(historical_provider);
+        }
+
+        let external_overlay_provider = ExternalOverlayStateProviderRef::new(
+            historical_provider,
+            self.preimage_store.clone(),
+            block_number,
+        );
+
+        Ok(Box::new(external_overlay_provider))
+    }
+}
+
+impl<Eth, P> EthApiExt<Eth, P> {
+    pub fn new(eth_api: Eth, preimage_store: P) -> Self {
+        Self {
+            eth_api,
+            preimage_store,
+        }
+    }
+}
+
+#[async_trait]
+impl<Eth, P> EthApiOverrideServer for EthApiExt<Eth, P>
+where
+    Eth: FullEthApi + Send + Sync + 'static,
+    jsonrpsee_types::error::ErrorObject<'static>: From<Eth::Error>,
+    P: ExternalStateStore + Clone + 'static,
+{
+    async fn get_proof(
+        &self,
+        address: Address,
+        keys: Vec<JsonStorageKey>,
+        block_number: Option<BlockId>,
+    ) -> RpcResult<EIP1186AccountProofResponse> {
+        // TODO:
+        let state = self
+            .state_provider(block_number)
+            .await
+            .map_err(Into::into)?;
+        let storage_keys = keys.iter().map(|key| key.as_b256()).collect::<Vec<_>>();
+
+        let proof = state
+            .proof(Default::default(), address, &storage_keys)
+            .map_err(Into::into)?;
+
+        return Ok(proof.into_eip1186_response(keys));
+    }
+}
