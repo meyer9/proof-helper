@@ -19,7 +19,7 @@ use reth_trie::{
     HashedPostState,
     updates::{StorageTrieUpdates, TrieUpdates},
 };
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 use tracing::{debug, info};
 
 pub struct LiveTrieCollector<Node, PreimageStore>
@@ -202,6 +202,7 @@ where
         &self,
         block: &RecoveredBlock<<<Node::Types as NodeTypes>::Primitives as NodePrimitives>::Block>,
     ) -> eyre::Result<()> {
+        let start = Instant::now();
         // ensure that we have the state of the parent block
         let (Some((earliest, _)), Some(latest)) = (
             self.storage.get_earliest_block_number().await?,
@@ -209,6 +210,8 @@ where
         ) else {
             return Err(eyre::eyre!("No blocks stored"));
         };
+
+        let fetch_block_duration = start.elapsed();
 
         let parent_block_number = block.number() - 1;
         if parent_block_number < earliest {
@@ -236,6 +239,8 @@ where
             parent_block_number,
         );
 
+        let init_provider_duration = start.elapsed() - fetch_block_duration;
+
         let db = StateProviderDatabase::new(&state_provider);
         let block_executor = self.evm_config.batch_executor(db);
 
@@ -243,9 +248,13 @@ where
             .execute(&(*block).clone())
             .map_err(|err| eyre::eyre!(err))?;
 
+        let execute_block_duration = start.elapsed() - init_provider_duration;
+
         let hashed_state = state_provider.hashed_post_state(&execution_result.state);
         let (state_root, trie_updates) =
             state_provider.state_root_with_updates(hashed_state.clone())?;
+
+        let calculate_state_root_duration = start.elapsed() - execute_block_duration;
 
         if state_root != block.state_root() {
             return Err(eyre::eyre!(
@@ -258,6 +267,24 @@ where
 
         let num_trie_updates = self.write_trie_updates(&trie_updates, block_number).await?;
         let num_leaf_updates = self.write_leaf_updates(hashed_state, block_number).await?;
+
+        let write_trie_updates_duration = start.elapsed() - calculate_state_root_duration;
+
+        debug!(
+            "execute_and_store_block_updates duration: {:?}",
+            start.elapsed()
+        );
+        debug!("- fetch_block_duration: {:?}", fetch_block_duration);
+        debug!("- init_provider_duration: {:?}", init_provider_duration);
+        debug!("- execute_block_duration: {:?}", execute_block_duration);
+        debug!(
+            "- calculate_state_root_duration: {:?}",
+            calculate_state_root_duration
+        );
+        debug!(
+            "- write_trie_updates_duration: {:?}",
+            write_trie_updates_duration
+        );
 
         info!(
             "Stored {} trie updates and {} leaf updates for block {}",

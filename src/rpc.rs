@@ -2,9 +2,7 @@ use async_trait::async_trait;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee_core::RpcResult;
 use reth::{
-    providers::{
-        BlockIdReader, DatabaseProviderFactory, ProviderError, ProviderResult, StateProviderBox,
-    },
+    providers::{BlockIdReader, ProviderError, ProviderResult, StateProviderBox},
     revm::primitives::Address,
     rpc::{
         api::eth::helpers::FullEthApi,
@@ -45,18 +43,16 @@ pub trait EthApiOverride {
 // }
 
 #[derive(Debug)]
-pub struct EthApiExt<Eth, P, Provider> {
+pub struct EthApiExt<Eth, P> {
     eth_api: Eth,
     preimage_store: P,
 }
 
-impl<Eth, P, Provider> EthApiExt<Eth, P, Provider>
+impl<Eth, P> EthApiExt<Eth, P>
 where
     Eth: FullEthApi + Send + Sync + 'static,
     jsonrpsee_types::error::ErrorObject<'static>: From<Eth::Error>,
     P: ExternalStateStore + Clone + 'static,
-    Provider: DatabaseProviderFactory + 'static,
-    Provider::Provider: Send + Sync + 'static,
 {
     async fn state_provider(&self, block_id: Option<BlockId>) -> ProviderResult<StateProviderBox> {
         let block_id = block_id.unwrap_or_default();
@@ -102,24 +98,21 @@ where
     }
 }
 
-impl<Eth, P, Provider> EthApiExt<Eth, P, Provider> {
-    pub fn new(eth_api: Eth, preimage_store: P, provider: Provider) -> Self {
+impl<Eth, P> EthApiExt<Eth, P> {
+    pub fn new(eth_api: Eth, preimage_store: P) -> Self {
         Self {
             eth_api,
             preimage_store,
-            provider,
         }
     }
 }
 
 #[async_trait]
-impl<Eth, P, Provider> EthApiOverrideServer for EthApiExt<Eth, P, Provider>
+impl<Eth, P> EthApiOverrideServer for EthApiExt<Eth, P>
 where
     Eth: FullEthApi + Send + Sync + 'static,
     jsonrpsee_types::error::ErrorObject<'static>: From<Eth::Error>,
     P: ExternalStateStore + Clone + 'static,
-    Provider: DatabaseProviderFactory + 'static,
-    Provider::Provider: Send + Sync + 'static,
 {
     async fn get_proof(
         &self,
