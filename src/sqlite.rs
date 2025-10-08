@@ -191,7 +191,8 @@ impl SqlitePreimageStoreStorageCursor {
         Ok(next_key_result.map(|bytes| B256::from_slice(&bytes)))
     }
 
-    /// Get the latest version of a specific storage key within the block limit
+    /// Get the latest version of a specific storage key within the block limit.
+    /// Returns None if the key doesn't exist or if the value is zero (zero values are treated as deleted).
     fn get_latest_storage_version(&self, key: &B256) -> ExternalStorageResult<Option<U256>> {
         let result = self.conn.lock().unwrap().query_row(
             "SELECT value FROM storage_nodes WHERE hashed_address = ? AND storage_key = ? AND block_number <= ? ORDER BY block_number DESC LIMIT 1",
@@ -202,7 +203,12 @@ impl SqlitePreimageStoreStorageCursor {
 
         if let Some(value_bytes) = result {
             let value = U256::from_be_slice(&value_bytes);
-            Ok(Some(value))
+            // Skip zero values - they are treated as deleted/non-existent in storage tries
+            if value.is_zero() {
+                Ok(None)
+            } else {
+                Ok(Some(value))
+            }
         } else {
             Ok(None)
         }
@@ -215,7 +221,6 @@ impl ExternalHashedCursor for SqlitePreimageStoreStorageCursor {
     fn seek(&mut self, key: B256) -> ExternalStorageResult<Option<(B256, Self::Value)>> {
         let result = self.find_next_valid_storage(&key)?;
         self.last_seeked = result.as_ref().map(|(key, _)| *key);
-        // info!("StorageHashedCursor::seek({:?}) = {:?}", key, result);
         Ok(result)
     }
 
@@ -233,13 +238,11 @@ impl ExternalHashedCursor for SqlitePreimageStoreStorageCursor {
         };
 
         self.last_seeked = result.as_ref().map(|(key, _)| *key);
-        // info!("StorageHashedCursor::next() = {:?}", result);
         Ok(result)
     }
 
     fn is_storage_empty(&mut self) -> ExternalStorageResult<bool> {
         let result = self.find_next_valid_storage(&B256::ZERO)?.is_none();
-        // info!("StorageHashedCursor::is_storage_empty() = {:?}", result);
         Ok(result)
     }
 }
@@ -250,7 +253,6 @@ impl ExternalHashedCursor for SqlitePreimageStoreAccountCursor {
     fn seek(&mut self, key: B256) -> ExternalStorageResult<Option<(B256, Self::Value)>> {
         let result = self.find_next_valid_account(&key)?;
         self.last_seeked = result.as_ref().map(|(key, _)| *key);
-        // info!("AccountHashedCursor::seek({:?}) = {:?}", key, result);
         Ok(result)
     }
 
@@ -268,13 +270,11 @@ impl ExternalHashedCursor for SqlitePreimageStoreAccountCursor {
         };
 
         self.last_seeked = result.as_ref().map(|(key, _)| *key);
-        // info!("AccountHashedCursor::next() = {:?}", result);
         Ok(result)
     }
 
     fn is_storage_empty(&mut self) -> ExternalStorageResult<bool> {
         let result = self.find_next_valid_account(&B256::ZERO)?.is_none();
-        // info!("AccountHashedCursor::is_storage_empty() = {:?}", result);
         Ok(result)
     }
 }
@@ -430,16 +430,6 @@ impl ExternalTrieCursor for SqlitePreimageStoreCursor {
         };
 
         self.last_seeked = Some(returned_path);
-        // info!(
-        //     "{}::seek_exact({:?}) = {:?}",
-        //     if let Some(hashed_address) = self.hashed_address {
-        //         "StorageTrieCursor"
-        //     } else {
-        //         "AccountTrieCursor"
-        //     },
-        //     path,
-        //     (returned_path, branch.clone())
-        // );
         Ok(Some((path, branch)))
     }
 
@@ -452,16 +442,6 @@ impl ExternalTrieCursor for SqlitePreimageStoreCursor {
             return Ok(None);
         };
         self.last_seeked = Some(returned_path);
-        // info!(
-        //     "{}::seek({:?}) = {:?}",
-        //     if let Some(hashed_address) = self.hashed_address {
-        //         "StorageTrieCursor"
-        //     } else {
-        //         "AccountTrieCursor"
-        //     },
-        //     path,
-        //     (returned_path, branch.clone())
-        // );
         Ok(Some((returned_path, branch)))
     }
 
@@ -471,53 +451,18 @@ impl ExternalTrieCursor for SqlitePreimageStoreCursor {
             if let Ok(Some((path, _branch))) = &result {
                 self.last_seeked = Some(*path);
             }
-            // info!(
-            //     "{}::next() = {:?}",
-            //     if let Some(hashed_address) = self.hashed_address {
-            //         "StorageTrieCursor"
-            //     } else {
-            //         "AccountTrieCursor"
-            //     },
-            //     result
-            // );
             return result;
         };
         let Some((returned_path, branch)) =
             self.seek_first_non_empty_path_after(last_seeked, false)?
         else {
-            // info!(
-            //     "{}::next() = None",
-            //     if let Some(hashed_address) = self.hashed_address {
-            //         "StorageTrieCursor"
-            //     } else {
-            //         "AccountTrieCursor"
-            //     },
-            // );
             return Ok(None);
         };
         self.last_seeked = Some(returned_path);
-        // info!(
-        //     "{}::next() = {:?}",
-        //     if let Some(hashed_address) = self.hashed_address {
-        //         "StorageTrieCursor"
-        //     } else {
-        //         "AccountTrieCursor"
-        //     },
-        //     (returned_path, branch.clone())
-        // );
         Ok(Some((returned_path, branch)))
     }
 
     fn current(&mut self) -> ExternalStorageResult<Option<Nibbles>> {
-        // info!(
-        //     "{}::current() = {:?}",
-        //     if let Some(hashed_address) = self.hashed_address {
-        //         "StorageTrieCursor"
-        //     } else {
-        //         "AccountTrieCursor"
-        //     },
-        //     self.last_seeked
-        // );
         Ok(self.last_seeked)
     }
 }
@@ -2291,5 +2236,92 @@ mod tests {
         // Seek should still work
         let result3 = cursor.seek(storage_key).unwrap().unwrap();
         assert_eq!(result3.0, storage_key);
+    }
+
+    #[tokio::test]
+    async fn test_storage_cursor_skips_zero_values() {
+        let store = setup_test_store().await;
+        let hashed_address = B256::repeat_byte(0x01);
+
+        // Create storage slots with a mix of zero and non-zero values
+        // Storage keys: 0x10, 0x20 (zero), 0x30, 0x40 (zero), 0x50
+        let storage_entries = vec![
+            (B256::repeat_byte(0x10), U256::from(100)),
+            (B256::repeat_byte(0x20), U256::ZERO), // Zero value - should be skipped
+            (B256::repeat_byte(0x30), U256::from(300)),
+            (B256::repeat_byte(0x40), U256::ZERO), // Zero value - should be skipped
+            (B256::repeat_byte(0x50), U256::from(500)),
+        ];
+
+        // Store all entries including zeros
+        store
+            .store_hashed_storages(
+                storage_entries
+                    .iter()
+                    .map(|(key, value)| (hashed_address, StorageEntry::new(*key, *value)))
+                    .collect(),
+                50,
+            )
+            .await
+            .unwrap();
+
+        let mut cursor = store.storage_hashed_cursor(hashed_address, 100).unwrap();
+
+        // Test 1: Iterate through all entries using next() - should skip zeros
+        let mut found_entries = Vec::new();
+        while let Some((key, value)) = cursor.next().unwrap() {
+            found_entries.push((key, value));
+        }
+
+        // Should only find non-zero values (0x10, 0x30, 0x50)
+        assert_eq!(found_entries.len(), 3);
+        assert_eq!(found_entries[0].0, B256::repeat_byte(0x10));
+        assert_eq!(found_entries[0].1, U256::from(100));
+        assert_eq!(found_entries[1].0, B256::repeat_byte(0x30));
+        assert_eq!(found_entries[1].1, U256::from(300));
+        assert_eq!(found_entries[2].0, B256::repeat_byte(0x50));
+        assert_eq!(found_entries[2].1, U256::from(500));
+
+        // Test 2: Seek to a zero value should skip to the next non-zero value
+        let mut cursor2 = store.storage_hashed_cursor(hashed_address, 100).unwrap();
+        let result = cursor2.seek(B256::repeat_byte(0x20)).unwrap().unwrap();
+        // Should skip 0x20 (zero) and find 0x30 (non-zero)
+        assert_eq!(result.0, B256::repeat_byte(0x30));
+        assert_eq!(result.1, U256::from(300));
+
+        // Test 3: Seek to just before a zero value should find the zero's successor
+        let mut cursor3 = store.storage_hashed_cursor(hashed_address, 100).unwrap();
+        let result = cursor3.seek(B256::repeat_byte(0x1F)).unwrap().unwrap();
+        // Should skip 0x20 (zero) and find 0x30 (non-zero)
+        // Actually, since we're seeking to 0x1F, it should first find 0x20 if present,
+        // but since 0x20 is zero, it should be skipped
+        // The expected behavior is to find the next non-zero value >= 0x1F
+        // which would be 0x10 if we're seeking, or skip through to 0x30
+        // Let me reconsider: if we seek to 0x1F, the next key >= 0x1F is 0x20,
+        // but 0x20 has zero value so it should be skipped, so we get 0x30
+        // But wait, 0x10 < 0x1F, so seeking to 0x1F should give us >= 0x1F
+        // So it should check 0x20 (zero, skip), then 0x30 (non-zero, return)
+        assert_eq!(result.0, B256::repeat_byte(0x30));
+        assert_eq!(result.1, U256::from(300));
+
+        // Test 4: is_storage_empty should consider zero values as non-existent
+        // Create a cursor for an address that only has zero values
+        let address_with_only_zeros = B256::repeat_byte(0x02);
+        store
+            .store_hashed_storages(
+                vec![(
+                    address_with_only_zeros,
+                    StorageEntry::new(B256::repeat_byte(0x10), U256::ZERO),
+                )],
+                50,
+            )
+            .await
+            .unwrap();
+
+        let mut cursor_zeros = store
+            .storage_hashed_cursor(address_with_only_zeros, 100)
+            .unwrap();
+        // Storage with only zero values should be considered empty
+        assert!(cursor_zeros.is_storage_empty().unwrap());
     }
 }
