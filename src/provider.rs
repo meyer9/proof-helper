@@ -11,8 +11,6 @@ use reth::{
         primitives::{Address, B256, Bytes, StorageValue, alloy_primitives::BlockNumber},
     },
 };
-use reth_db_api::tables;
-use reth_db_api::transaction::DbTx;
 use reth_trie::KeccakKeyHasher;
 use reth_trie::witness::TrieWitness;
 use reth_trie::{
@@ -30,11 +28,9 @@ use crate::{
     storage::ExternalStateStore,
 };
 
-pub struct ExternalOverlayStateProviderRef<'a, P: ExternalStateStore, Provider: DBProvider> {
+pub struct ExternalOverlayStateProviderRef<'a, P: ExternalStateStore> {
     /// Historical state provider for non-trie related tasks.
     pub(crate) latest: Box<dyn StateProvider + 'a>,
-
-    pub(crate) provider: Provider,
 
     /// Storage provider for state lookups.
     pub(crate) storage: P,
@@ -42,24 +38,10 @@ pub struct ExternalOverlayStateProviderRef<'a, P: ExternalStateStore, Provider: 
     pub(crate) block_number: BlockNumber,
 }
 
-impl<P: ExternalStateStore, Provider: DBProvider> ExternalOverlayStateProviderRef<'_, P, Provider> {
-    fn tx(&self) -> &Provider::Tx {
-        self.provider.tx_ref()
-    }
-}
-
-impl<'a, P: ExternalStateStore, Provider: DBProvider>
-    ExternalOverlayStateProviderRef<'a, P, Provider>
-{
-    pub fn new(
-        latest: Box<dyn StateProvider + 'a>,
-        storage: P,
-        provider: Provider,
-        block_number: BlockNumber,
-    ) -> Self {
+impl<'a, P: ExternalStateStore> ExternalOverlayStateProviderRef<'a, P> {
+    pub fn new(latest: Box<dyn StateProvider + 'a>, storage: P, block_number: BlockNumber) -> Self {
         Self {
             latest,
-            provider,
             storage,
             block_number,
         }
@@ -72,9 +54,7 @@ impl Into<ProviderError> for ExternalStorageError {
     }
 }
 
-impl<'a, P: ExternalStateStore, Provider: DBProvider + Send + Sync> BlockHashReader
-    for ExternalOverlayStateProviderRef<'a, P, Provider>
-{
+impl<'a, P: ExternalStateStore> BlockHashReader for ExternalOverlayStateProviderRef<'a, P> {
     fn block_hash(&self, number: BlockNumber) -> ProviderResult<Option<B256>> {
         self.latest.block_hash(number)
     }
@@ -88,8 +68,8 @@ impl<'a, P: ExternalStateStore, Provider: DBProvider + Send + Sync> BlockHashRea
     }
 }
 
-impl<'a, P: ExternalStateStore + Clone, Provider: DBProvider + Send + Sync> StateRootProvider
-    for ExternalOverlayStateProviderRef<'a, P, Provider>
+impl<'a, P: ExternalStateStore + Clone> StateRootProvider
+    for ExternalOverlayStateProviderRef<'a, P>
 {
     #[tracing::instrument(skip(self, state))]
     fn state_root(&self, state: HashedPostState) -> ProviderResult<B256> {
@@ -126,8 +106,8 @@ impl<'a, P: ExternalStateStore + Clone, Provider: DBProvider + Send + Sync> Stat
     }
 }
 
-impl<'a, P: ExternalStateStore + Clone, Provider: DBProvider + Send + Sync> StorageRootProvider
-    for ExternalOverlayStateProviderRef<'a, P, Provider>
+impl<'a, P: ExternalStateStore + Clone> StorageRootProvider
+    for ExternalOverlayStateProviderRef<'a, P>
 {
     #[tracing::instrument(skip(self, storage), level = "info")]
     fn storage_root(&self, address: Address, storage: HashedStorage) -> ProviderResult<B256> {
@@ -170,8 +150,8 @@ impl<'a, P: ExternalStateStore + Clone, Provider: DBProvider + Send + Sync> Stor
     }
 }
 
-impl<'a, P: ExternalStateStore + Clone, Provider: DBProvider + Send + Sync> StateProofProvider
-    for ExternalOverlayStateProviderRef<'a, P, Provider>
+impl<'a, P: ExternalStateStore + Clone> StateProofProvider
+    for ExternalOverlayStateProviderRef<'a, P>
 {
     #[tracing::instrument(skip(self, input, slots), level = "info")]
     fn proof(
@@ -208,18 +188,14 @@ impl<'a, P: ExternalStateStore + Clone, Provider: DBProvider + Send + Sync> Stat
     }
 }
 
-impl<'a, P: ExternalStateStore, Provider: DBProvider + Send + Sync> HashedPostStateProvider
-    for ExternalOverlayStateProviderRef<'a, P, Provider>
-{
+impl<'a, P: ExternalStateStore> HashedPostStateProvider for ExternalOverlayStateProviderRef<'a, P> {
     #[tracing::instrument(skip(self, bundle_state), level = "info")]
     fn hashed_post_state(&self, bundle_state: &BundleState) -> HashedPostState {
         HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle_state.state())
     }
 }
 
-impl<'a, P: ExternalStateStore, Provider: DBProvider> AccountReader
-    for ExternalOverlayStateProviderRef<'a, P, Provider>
-{
+impl<'a, P: ExternalStateStore> AccountReader for ExternalOverlayStateProviderRef<'a, P> {
     #[tracing::instrument(skip(self), level = "info")]
     fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
         let hashed_key = keccak256(&address.0);
@@ -240,9 +216,7 @@ impl<'a, P: ExternalStateStore, Provider: DBProvider> AccountReader
     }
 }
 
-impl<'a, P: ExternalStateStore + Clone, Provider: DBProvider + Send + Sync> StateProvider
-    for ExternalOverlayStateProviderRef<'a, P, Provider>
-{
+impl<'a, P: ExternalStateStore + Clone> StateProvider for ExternalOverlayStateProviderRef<'a, P> {
     #[tracing::instrument(skip(self), level = "info")]
     fn storage(&self, address: Address, storage_key: B256) -> ProviderResult<Option<StorageValue>> {
         let hashed_key = keccak256(storage_key);
@@ -263,13 +237,9 @@ impl<'a, P: ExternalStateStore + Clone, Provider: DBProvider + Send + Sync> Stat
     }
 }
 
-impl<'a, P: ExternalStateStore, Provider: DBProvider + Send + Sync> BytecodeReader
-    for ExternalOverlayStateProviderRef<'a, P, Provider>
-{
+impl<'a, P: ExternalStateStore> BytecodeReader for ExternalOverlayStateProviderRef<'a, P> {
     #[tracing::instrument(skip(self), level = "info")]
     fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>> {
-        self.tx()
-            .get_by_encoded_key::<tables::Bytecodes>(code_hash)
-            .map_err(Into::into)
+        self.latest.bytecode_by_hash(code_hash)
     }
 }

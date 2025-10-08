@@ -96,7 +96,6 @@ where
         let external_overlay_provider = ExternalOverlayStateProviderRef::new(
             historical_provider,
             self.preimage_store.clone(),
-            self.provider.database_provider_ro()?,
             block_number,
         );
 

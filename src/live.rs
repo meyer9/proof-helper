@@ -9,12 +9,15 @@ use reth::{
     builder::NodeTypes,
     core::primitives::AlloyBlockHeader,
     primitives::{RecoveredBlock, StorageEntry},
-    providers::{DatabaseProviderFactory, StateProviderFactory, StateReader, StateRootProvider},
+    providers::{
+        DatabaseProviderFactory, HashedPostStateProvider, StateProviderFactory, StateReader,
+        StateRootProvider,
+    },
     revm::database::StateProviderDatabase,
 };
 use reth_evm::{ConfigureEvm, execute::Executor};
 use reth_trie::{
-    HashedPostState, KeccakKeyHasher,
+    HashedPostState,
     updates::{StorageTrieUpdates, TrieUpdates},
 };
 use std::collections::HashMap;
@@ -226,56 +229,13 @@ where
 
         let block_number = block.number();
 
-        let print_sorted_post_state = |hashed_state: HashedPostState| {
-            for (address, account) in hashed_state
-                .accounts
-                .iter()
-                .sorted_by_key(|(address, _)| *address)
-            {
-                info!("Account: {:?}: {:?}", address, account);
-            }
-            for (address, storage) in hashed_state
-                .storages
-                .iter()
-                .sorted_by_key(|(address, _)| *address)
-            {
-                info!("Storage: {:?}", address);
-                info!("wiped?: {}", storage.wiped);
-                for (slot, value) in storage.storage.iter().sorted_by_key(|(slot, _)| *slot) {
-                    info!("Slot: {:?}: {:?}", slot, value);
-                }
-            }
-        };
-
         // TODO: should we check block hash here?
 
         let state_provider = ExternalOverlayStateProviderRef::new(
-            self.provider.latest()?,
+            self.provider.state_by_block_hash(block.parent_hash())?,
             self.storage.clone(),
-            self.provider.database_provider_ro()?,
             parent_block_number,
         );
-
-        // let historical_state_provider = self
-        //     .provider
-        //     .state_by_block_id(BlockId::Number(parent_block_number.into()))?;
-
-        // info!("--- HISTORICAL POST STATE ---");
-        // let historical_state_db = StateProviderDatabase::new(&historical_state_provider);
-        // let historical_block_executor = self.evm_config.batch_executor(historical_state_db);
-
-        // let historical_execution_result = historical_block_executor
-        //     .execute(&(*block).clone())
-        //     .map_err(|err| eyre::eyre!(err))?;
-
-        // let historical_hashed_state = HashedPostState::from_bundle_state::<KeccakKeyHasher>(
-        //     historical_execution_result.state.state(),
-        // );
-
-        // print_sorted_post_state(historical_hashed_state.clone());
-        // historical_state_provider.state_root_with_updates(historical_hashed_state.clone())?;
-
-        info!("--- EXTERNAL POST STATE ---");
 
         let db = StateProviderDatabase::new(&state_provider);
         let block_executor = self.evm_config.batch_executor(db);
@@ -284,9 +244,7 @@ where
             .execute(&(*block).clone())
             .map_err(|err| eyre::eyre!(err))?;
 
-        let hashed_state =
-            HashedPostState::from_bundle_state::<KeccakKeyHasher>(execution_result.state.state());
-        print_sorted_post_state(hashed_state.clone());
+        let hashed_state = state_provider.hashed_post_state(&execution_result.state);
         let (state_root, trie_updates) =
             state_provider.state_root_with_updates(hashed_state.clone())?;
 
