@@ -247,7 +247,6 @@ where
         let (state_root, trie_updates) =
             state_provider.state_root_with_updates(hashed_state.clone())?;
 
-        info!("--- END EXTERNAL POST STATE ---");
         if state_root != block.state_root() {
             return Err(eyre::eyre!(
                 "State root mismatch for block {} (have: {}, expected: {})",
