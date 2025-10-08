@@ -1,6 +1,4 @@
-#![warn(clippy::future_not_send)]
-
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use alloy_primitives::B256;
 use reth::primitives::{Account, StorageEntry};
@@ -95,6 +93,7 @@ define_dup_cursor_iter!(
     StorageTrieEntry
 );
 
+/// Trait to estimate the progress of a backfill job based on the key.
 trait CompletionEstimatable {
     // Returns a progress estimate as a percentage (0.0 to 1.0)
     fn estimate_progress(&self) -> f64;
@@ -128,11 +127,12 @@ impl CompletionEstimatable for StoredNibbles {
     }
 }
 
+/// Backfill a table from a source iterator to a storage function. Handles batching and logging.
 async fn backfill<
     S: Iterator<Item = Result<(Key, Value), DatabaseError>>,
     F: Future<Output = eyre::Result<()>> + Send,
-    Key: CompletionEstimatable + Clone,
-    Value: Clone,
+    Key: CompletionEstimatable + Clone + 'static,
+    Value: Clone + 'static,
 >(
     name: &str,
     source: S,
@@ -147,7 +147,17 @@ async fn backfill<
     info!("Starting {} backfill", name);
     let start_time = Instant::now();
 
+    let mut source = source.peekable();
+    let initial_progress = source
+        .peek()
+        .and_then(|entry| Some(entry.clone().map(|entry| entry.0.estimate_progress())))
+        .transpose()?;
+
     for entry in source {
+        let Some(initial_progress) = initial_progress else {
+            // If there are any items, there must be an initial progress
+            unreachable!();
+        };
         let entry = entry?;
 
         entries.push(entry.clone());
@@ -157,19 +167,21 @@ async fn backfill<
             let progress = entry.0.estimate_progress();
             let elapsed = start_time.elapsed();
             let elapsed_secs = elapsed.as_secs_f64();
-            let estimated_total_time = if progress > 0.0 {
-                elapsed_secs / (progress)
+
+            let progress_per_second = if elapsed_secs.is_normal() {
+                (progress - initial_progress) / elapsed_secs
+            } else {
+                0.0
+            };
+            let estimated_total_time = if progress_per_second.is_normal() {
+                (1.0 - progress) / progress_per_second
             } else {
                 0.0
             };
             let progress_pct = progress * 100.0;
-            let remaining_time = estimated_total_time - elapsed_secs;
-            let eta_duration = Duration::from_secs(remaining_time as u64);
             info!(
                 "Processed {} {}, progress: {progress_pct:.2}%, ETA: {}s",
-                name,
-                total_entries,
-                eta_duration.as_secs()
+                name, total_entries, estimated_total_time,
             );
         }
 

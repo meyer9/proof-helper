@@ -1,4 +1,3 @@
-#![warn(clippy::future_not_send)]
 use futures_util::TryStreamExt;
 use op_reth::node::OpNode;
 use reth::{
